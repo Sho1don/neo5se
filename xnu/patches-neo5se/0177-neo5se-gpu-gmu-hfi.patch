@@ -540,7 +540,7 @@ index 6258b5a..67d1cb6 100644
  	/*
  	 * The GMU's own reset: the bootloader leaves the block asserted. The
  	 * qcom BCR asserts with bit 0 set and deasserts with it clear.
-@@ -302,10 +507,627 @@ neo5se_gpu_power(vm_offset_t gpucc)
+@@ -302,10 +507,631 @@ neo5se_gpu_power(vm_offset_t gpucc)
  	    neo5se_gpu_read(gpucc, GPUCC_GMU_BCR));
  }
  
@@ -916,7 +916,10 @@ index 6258b5a..67d1cb6 100644
 +	neo5se_log_flush_now();
 +
 +	/* Firmware: TCM blocks through the GMU window, the 0x4000 block through
-+	 * the icache buffer (IOVA 0x4000), then flush it for the GMU. */
++	 * the icache buffer (IOVA 0x4000), then flush it for the GMU. Like the
++	 * load_tcm path above, without the generated neo5se_gmu_fw.h this
++	 * stays out of the build ("keeps the old behaviour"). */
++#ifdef NEO5SE_GMU_FW
 +	for (i = 0; i < neo5se_gmu_block_count; i++) {
 +		const struct neo5se_gmu_block *blk = &neo5se_gmu_blocks[i];
 +		uint32_t base;
@@ -953,6 +956,7 @@ index 6258b5a..67d1cb6 100644
 +		printf("NEO5SE GPU: fw tcm 0x%x len 0x%x -> 0x%x\n",
 +		    blk->addr, blk->len, base);
 +	}
++#endif /* NEO5SE_GMU_FW */
 +	neo5se_log_flush_now();
 +
 +	/*

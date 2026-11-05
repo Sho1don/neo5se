@@ -540,7 +540,7 @@ index 6258b5a..67d1cb6 100644
  	/*
  	 * The GMU's own reset: the bootloader leaves the block asserted. The
  	 * qcom BCR asserts with bit 0 set and deasserts with it clear.
-@@ -302,10 +507,627 @@ mondrian_gpu_power(vm_offset_t gpucc)
+@@ -302,10 +507,631 @@ mondrian_gpu_power(vm_offset_t gpucc)
  	    mondrian_gpu_read(gpucc, GPUCC_GMU_BCR));
  }
  
@@ -916,7 +916,10 @@ index 6258b5a..67d1cb6 100644
 +	mondrian_log_flush_now();
 +
 +	/* Firmware: TCM blocks through the GMU window, the 0x4000 block through
-+	 * the icache buffer (IOVA 0x4000), then flush it for the GMU. */
++	 * the icache buffer (IOVA 0x4000), then flush it for the GMU. Like the
++	 * load_tcm path above, without the generated mondrian_gmu_fw.h this
++	 * stays out of the build ("keeps the old behaviour"). */
++#ifdef MONDRIAN_GMU_FW
 +	for (i = 0; i < mondrian_gmu_block_count; i++) {
 +		const struct mondrian_gmu_block *blk = &mondrian_gmu_blocks[i];
 +		uint32_t base;
@@ -953,6 +956,7 @@ index 6258b5a..67d1cb6 100644
 +		printf("MONDRIAN GPU: fw tcm 0x%x len 0x%x -> 0x%x\n",
 +		    blk->addr, blk->len, base);
 +	}
++#endif /* MONDRIAN_GMU_FW */
 +	mondrian_log_flush_now();
 +
 +	/*
