@@ -45,6 +45,13 @@ case "$BOARD" in
 		# (tools/dtdump.py --build) to embed.
 		DTB=${DTB:-}
 		;;
+	neo5se)
+		BOARD_DEF=BOARD_NEO5SE
+		# Like the mondrian: header v3 without a DTB, the bootloader
+		# passes the live device tree from vendor_boot. DTB= can embed
+		# a captured tree once one is dumped from the phone.
+		DTB=${DTB:-}
+		;;
 	*) echo "error: unknown BOARD '$BOARD' (sweet or mondrian)" >&2; exit 1 ;;
 esac
 if [ -n "$DTB" ]; then

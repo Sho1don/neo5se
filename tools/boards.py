@@ -7,7 +7,7 @@ RAM the kernel may use, how the CPUs are numbered, what the panel looks like.
 Keeping them in one place makes adding a board a data change instead of a
 code change.
 
-Two boards are described here:
+Three boards are described here:
 
   sweet     Redmi Note 10 Pro (Qualcomm SM7150 / Snapdragon 732G, ARMv8.2).
             The upstream project. Every value was measured on the device.
@@ -17,6 +17,12 @@ Two boards are described here:
             mondrian-s-oss) unless the comment says otherwise; the ones that
             still need a reading from the live device are marked TODO and can
             be filled in from a shim "dtb dump" (see apply_facts()).
+  neo5se    Realme GT Neo 5 SE (Qualcomm SM7475-AB / Snapdragon 7+ Gen 2,
+            ARMv9.0). Work in progress: the SoC is from the SM8450 family
+            like the mondrian's, so its values are the starting guesses.
+            Everything not confirmed on the phone is provisional; the shim
+            dtb dump (see apply_facts()) is the way to measure it. No Realme
+            vendor device tree source for this board is used yet.
 
 Sources for the mondrian numbers:
 
@@ -306,7 +312,85 @@ MONDRIAN = Board(
              'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1'),
 )
 
-BOARDS = {b.name: b for b in (SWEET, MONDRIAN)}
+# --------------------------------------------------------------------------
+# neo5se: Realme GT Neo 5 SE (SM7475-AB / Snapdragon 7+ Gen 2)
+# --------------------------------------------------------------------------
+# Same core complex as the mondrian (one Cortex-X2, three Cortex-A710,
+# four Cortex-A510, ARMv9.0, 16 KiB granule like the whole family) but a
+# different vendor: Realme, not Xiaomi. This board is not measured yet:
+# every value below is either a structural property of the SoC family or a
+# mondrian-derived starting guess, and is provisional until the shim prints
+# the live device tree on the phone (apply_facts() below).
+NEO5SE = Board(
+    name='neo5se',
+    title='Realme GT Neo 5 SE (neo5se, SM7475-AB / Snapdragon 7+ Gen 2)',
+    soc='SM7475',
+    arch='armv9.0',
+    machine_config='NEO5SE',
+    dt_prefix='neo5se',
+    payload_magic=b'NEO5SE01',
+    # 16 KiB like iOS; the SM8450 CPU family implements the granule
+    # (the mondrian measured TGran16=1 on the silicon of the same cores).
+    page_size=16384,
+    # Starting window copied from the mondrian's rules (the panel pages
+    # inside, ending at the first firmware carve-out). The real values come
+    # from the live /memory and /reserved-memory nodes.
+    phys_base=0xb0000000,
+    mem_size=0x30000000,
+    # Pinned like on the mondrian: the physmap slide comes from this seed.
+    seed=b'\x11' * 64,
+    alt_phys_base=0x800000000,
+    alt_mem_size=0x37500000,
+    soc_base=0x01000000,
+    # GICD/GICR of the SM8450 family (cape.dtsi), one redistributor region,
+    # stride 0x40000. Confirmed on the mondrian family; provisional here.
+    gicd=0x17100000,
+    gicd_size=0x10000,
+    gicr=0x17180000,
+    gicr_size=0x200000,
+    gicr_pe_size=0x40000,
+    # Splash framebuffer: unknown on this board (44 MiB is the mondrian's
+    # cont_splash region; the real one comes from the live device tree).
+    fb=0xb8000000,
+    fb_size=0x2b00000,
+    fb_w=1240,
+    fb_h=2772,
+    # UFS host: the 0x1d84000 window is shared by the whole soС family.
+    ufs=0x01d84000,
+    ufs_size=0x3000,
+    gcc=0x100000,
+    ufs_gcc_branch=0x870,
+    timebase=19200000,
+    vtimer_intid=27,             # PPI 11 + 16, the Qualcomm family layout
+    ipi_sgi=1,
+    tt_l2_size=0x2000000,
+    cpus=tuple(
+        Cpu(aff1=i, cluster=0 if i < 4 else (1 if i < 7 else 2),
+            freq=2910000000 if i == 0 else (2490000000 if i < 4 else 1800000000),
+            l2=i)
+        for i in range(8)
+    ),
+    ecid=0x4e454f3553453031,     # 'NEO5SE01', synthetic
+    touch='',                    # unknown until the stock device tree is read
+    keys='',                     # unknown (SM8450-family PMICs: PM8350 class)
+    panel='amoled-dsi',
+    provisional=frozenset({
+        'phys_base', 'mem_size',
+        'alt_phys_base', 'alt_mem_size',
+        'gicd', 'gicr',
+        'fb', 'fb_size', 'fb_w', 'fb_h',
+        'ufs',
+        'gcc', 'ufs_gcc_branch',
+    }),
+    # The boot arguments mirror the mondrian's, with this board's
+    # framebuffer prefix. serial=0 until a UART shows up on the board.
+    cmdline=('debug=0xc serial=0 cpus=1 keepsyms=1 -noprogress '
+             'rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
+             'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
+             'wdt=-1 neo5sefb_noconsole=1 neo5sefb_hz=30'),
+)
+
+BOARDS = {b.name: b for b in (SWEET, MONDRIAN, NEO5SE)}
 
 
 def get_board(name):

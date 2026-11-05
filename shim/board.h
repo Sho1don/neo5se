@@ -6,7 +6,7 @@
  * in tools/boards.py, which feeds the Apple Device Tree builder. Keep both in
  * sync (tools/boards.py is the reference).
  *
- * Build with BOARD=sweet (default) or BOARD=mondrian (shim/build.sh).
+ * Build with BOARD=sweet (default), BOARD=mondrian or BOARD=neo5se (shim/build.sh).
  */
 
 #if defined(BOARD_MONDRIAN)
@@ -96,6 +96,63 @@ static const uint64_t board_reserved[BOARD_RESERVED_N][2] = {
 	{ 0xe8900000UL, 0x01200000UL },	/* tags_region */
 	{ 0xe9b00000UL, 0x00500000UL },	/* qtee_region */
 };
+
+#elif defined(BOARD_NEO5SE)
+
+/* Realme GT Neo 5 SE ("neo5se", Qualcomm SM7475-AB / Snapdragon 7+ Gen 2).
+ * SM8450 CPU family (the same X2/A710/A510 cluster as the mondrian), but a
+ * Realme board: none of these numbers is measured yet. The shim reads the
+ * live device tree first; the constants below are the documented fallbacks
+ * from the mondrian and exist only so the diagnostics shim builds and prints
+ * the FACT dump on the phone. */
+#define BOARD_NAME		"neo5se"
+#define BOARD_SOC		"SM7475"
+
+/* SM8450-family GIC, stride 0x40000 (same as the mondrian). */
+#define GICD_BASE		0x17100000UL
+#define GICR_BASE		0x17180000UL
+#define GICR_SIZE		0x200000UL
+#define GICR_PE_SIZE		0x40000UL
+
+/* PPI 11 -> GIC INTID 27, like every SoC of this family. */
+#define VTIMER_INTID		27
+#define PTIMER_INTID		18
+#define SGI_INTID		1
+
+/* RAM window: unknown on this board. The live device tree answers; the shim
+ * prints the memory regions on the screen instead of trusting a constant. */
+#define BOARD_MEM_BASE		0UL
+#define BOARD_MEM_SIZE		0UL
+
+/* UFS host fallback (the 0x1d84000 window is shared by the SoC family). */
+#define UFS_BASE		0x01d84000UL
+
+/* Splash framebuffer fallback: unverified on Realme; the live tree normally
+ * names the cont_splash region from vendor_boot. */
+#define FB_BASE			0xb8000000UL
+#define FB_SIZE			0x2b00000UL
+#define FB_W			1240
+#define FB_H			2772
+#define FB_STRIDE		(FB_W * 4)
+
+#define PAYLOAD_MAGIC		"NEO5SE01"
+
+#define NR_CPUS			8
+
+#define BOARD_FB_FROM_DTB	0
+
+/* No wipe: the firmware carve-out set of this board is unknown. Wiping the
+ * window could scribble on a secure-world region and reset the phone. Until
+ * the live /reserved-memory is measured, the window is left as the
+ * bootloader handed it; the stale-common pages are a later problem, solved
+ * with the mondrian's BOARD_WIPE=1 once the FACT dump lists the regions. */
+#define BOARD_WIPE		0
+#define BOARD_RESERVED_N	0
+#if BOARD_RESERVED_N
+static const uint64_t board_reserved[BOARD_RESERVED_N][2] = { { 0, 0 } };
+#else
+static const uint64_t board_reserved[1][2] = { { 0, 0 } };
+#endif
 
 #else	/* BOARD_SWEET (default) */
 
