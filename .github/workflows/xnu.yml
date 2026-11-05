@@ -18,6 +18,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      runner:
+        description: Hosted runner label (macos-15 is saturated at times; macos-latest = macos-26, ships a newer Xcode/iig)
+        default: macos-15
   push:
     branches: [main, mondrian]
     paths:
@@ -28,8 +31,9 @@ on:
 
 concurrency:
   # the env context is not available here, so the board comes from the input
-  # or from the branch
-  group: xnu-${{ github.ref }}-${{ inputs.board || (startsWith(github.ref, 'refs/heads/mondrian') && 'mondrian' || 'sweet') }}
+  # or from the branch; the runner label keeps a macos-15 fallback run and a
+  # macos-latest attempt for the same board from cancelling each other
+  group: xnu-${{ github.ref }}-${{ inputs.board || (startsWith(github.ref, 'refs/heads/mondrian') && 'mondrian' || 'sweet') }}-${{ inputs.runner || 'default' }}
   cancel-in-progress: true
 
 env:
@@ -45,8 +49,11 @@ jobs:
     # macos-15: macos-14 was retired from hosted runners (the fork built on it
     # until then). The oldest Xcode on the image is 16.0; its iig emits
     # IORPC.kernelContent, which xnu-8796 lacks, so the series backports that
-    # field (0189). If a newer image is needed, keep picking the oldest Xcode.
-    runs-on: macos-15
+    # field (0189). macos-15 capacity comes and goes: "The job was not acquired
+    # by Runner even after multiple attempts" means the queue drained nothing,
+    # not a compile error -- rerun, or pick macos-latest (= macos-26 arm64,
+    # ships Xcode 17: unknown iig delta, iterate if it reports new symbols).
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
