@@ -2,15 +2,14 @@ name: runner-probe
 on:
   workflow_dispatch: {}
 jobs:
-  linux:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo linux-ok
-  mac:
-    runs-on: macos-latest
-    steps:
-      - run: echo mac-ok
   mac15:
     runs-on: macos-15
     steps:
-      - run: echo mac15-ok
+      - name: xcodes
+        run: ls -d /Applications/Xcode*.app || true
+      - name: xcodes 26
+        run: ls -d /Applications/Xcode*26* 2>/dev/null || true
+  mac14large:
+    runs-on: macos-14-large
+    steps:
+      - run: echo ok
