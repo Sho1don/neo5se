@@ -1,0 +1,192 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -381,6 +381,7 @@
+ bsd/kern/kern_credential.c		standard
+ bsd/kern/kern_crossarch.c		standard
+ bsd/kern/kern_cs.c			standard
++bsd/kern/neo5se_amfi.c			standard
+ bsd/kern/kern_csr.c			optional config_csr
+ bsd/kern/kern_debug.c			standard
+ bsd/kern/kern_symfile.c			standard
+diff --git a/bsd/kern/neo5se_amfi.c b/bsd/kern/neo5se_amfi.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/kern/neo5se_amfi.c
+@@ -0,0 +1,176 @@
++/*
++ * Built-in AMFI interface for NEO5SE.
++ *
++ * On Apple platforms AppleMobileFileIntegrity registers this interface and
++ * provides entitlements through the closed CoreEntitlements library. NEO5SE
++ * has neither, and code signing reaches it on every exec (ubc_cs_blob_add).
++ *
++ * This provider honestly reports that no entitlements exist: code signature
++ * blobs get no OSEntitlements object (csb_entitlements stays NULL, which the
++ * kernel already handles), every entitlement query fails and every copy
++ * returns nothing. Nothing is granted. Code signature and page hash
++ * validation stay with the kernel. Trust caches remain unavailable (no
++ * Image4), so the TrustCache interface is left at version 0.
++ *
++ * Interfaces no kernel path uses on NEO5SE (they serve other Apple kexts)
++ * panic with a clear message instead of being NULL.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEO5SE)
++#include <kern/debug.h>
++#include <kern/startup.h>
++#include <libkern/amfi/amfi.h>
++#include <mach/kern_return.h>
++#include <sys/proc.h>
++#include <sys/systm.h>
++
++static void
++neo5se_amfi_entitlements_invalidate(__unused void *os_entitlements)
++{
++	/* No OSEntitlements objects are ever created. */
++}
++
++static void *
++neo5se_amfi_entitlements_as_dict(__unused void *os_entitlements)
++{
++	return NULL;
++}
++
++static CEError_t
++neo5se_amfi_entitlements_query(__unused void *os_entitlements,
++    __unused uint8_t cdhash[CS_CDHASH_LEN], __unused CEQuery_t query,
++    __unused size_t query_length)
++{
++	panic("NEO5SE AMFI: CoreEntitlements queries are not implemented");
++}
++
++static bool
++neo5se_amfi_entitlements_get_transmuted(__unused void *os_entitlements,
++    __unused const CS_GenericBlob **blob)
++{
++	return false;
++}
++
++static bool
++neo5se_amfi_entitlements_get_xml(__unused void *os_entitlements,
++    __unused CS_GenericBlob **blob)
++{
++	return false;
++}
++
++static bool
++neo5se_amfi_get_legacy_profile_exemptions(__unused const uint8_t **profile,
++    __unused size_t *profile_length)
++{
++	return false;
++}
++
++static bool
++neo5se_amfi_get_udid(__unused const uint8_t **udid, __unused size_t *udid_length)
++{
++	return false;
++}
++
++static void *
++neo5se_amfi_query_context_to_object(__unused CEQueryContext_t ctx)
++{
++	panic("NEO5SE AMFI: CoreEntitlements query contexts are not implemented");
++}
++
++static kern_return_t
++neo5se_amfi_adjust_with_monitor(__unused void *os_entitlements,
++    __unused const CEQueryContext_t ce_ctx, __unused const void *monitor_sig_obj,
++    __unused const char *identity, __unused const uint32_t code_signing_flags)
++{
++	/* NEO5SE has no code signing monitor. */
++	return KERN_NOT_SUPPORTED;
++}
++
++static kern_return_t
++neo5se_amfi_adjust_without_monitor(__unused void *os_entitlements,
++    __unused struct cs_blob *code_signing_blob)
++{
++	/* Leave the blob without an entitlements context: it has none. */
++	return KERN_SUCCESS;
++}
++
++static kern_return_t
++neo5se_amfi_query_boolean(__unused const void *os_entitlements,
++    __unused const char *entitlement_name)
++{
++	return KERN_DENIED;
++}
++
++static kern_return_t
++neo5se_amfi_query_boolean_with_proc(__unused const proc_t proc,
++    __unused const char *entitlement_name)
++{
++	return KERN_DENIED;
++}
++
++static kern_return_t
++neo5se_amfi_query_string(__unused const void *os_entitlements,
++    __unused const char *entitlement_name, __unused const char *entitlement_value)
++{
++	return KERN_DENIED;
++}
++
++static kern_return_t
++neo5se_amfi_query_string_with_proc(__unused const proc_t proc,
++    __unused const char *entitlement_name, __unused const char *entitlement_value)
++{
++	return KERN_DENIED;
++}
++
++static kern_return_t
++neo5se_amfi_copy_object(__unused const void *os_entitlements,
++    __unused const char *entitlement_name, void **entitlement_object)
++{
++	if (entitlement_object) {
++		*entitlement_object = NULL;
++	}
++	return KERN_NOT_FOUND;
++}
++
++static kern_return_t
++neo5se_amfi_copy_object_with_proc(__unused const proc_t proc,
++    __unused const char *entitlement_name, void **entitlement_object)
++{
++	if (entitlement_object) {
++		*entitlement_object = NULL;
++	}
++	return KERN_NOT_FOUND;
++}
++
++static const amfi_t neo5se_amfi = {
++	.OSEntitlements_invalidate = neo5se_amfi_entitlements_invalidate,
++	.OSEntitlements_asdict = neo5se_amfi_entitlements_as_dict,
++	.OSEntitlements_query = neo5se_amfi_entitlements_query,
++	.OSEntitlements_get_transmuted = neo5se_amfi_entitlements_get_transmuted,
++	.OSEntitlements_get_xml = neo5se_amfi_entitlements_get_xml,
++	/* CoreEntitlements is only used by the PMAP_CS code signing monitor. */
++	.get_legacy_profile_exemptions = neo5se_amfi_get_legacy_profile_exemptions,
++	.get_udid = neo5se_amfi_get_udid,
++	.query_context_to_object = neo5se_amfi_query_context_to_object,
++	/* .TrustCache stays version 0: trust caches are unavailable without Image4. */
++	.OSEntitlements = {
++		.version = OSENTITLEMENTS_INTERFACE_VERSION,
++		.adjustContextWithMonitor = neo5se_amfi_adjust_with_monitor,
++		.adjustContextWithoutMonitor = neo5se_amfi_adjust_without_monitor,
++		.queryEntitlementBoolean = neo5se_amfi_query_boolean,
++		.queryEntitlementBooleanWithProc = neo5se_amfi_query_boolean_with_proc,
++		.queryEntitlementString = neo5se_amfi_query_string,
++		.queryEntitlementStringWithProc = neo5se_amfi_query_string_with_proc,
++		.copyEntitlementAsOSObject = neo5se_amfi_copy_object,
++		.copyEntitlementAsOSObjectWithProc = neo5se_amfi_copy_object_with_proc,
++	},
++};
++
++__startup_func
++static void
++neo5se_amfi_register(void)
++{
++	amfi_interface_register(&neo5se_amfi);
++	printf("NEO5SE AMFI: built-in interface registered (no entitlements)\n");
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, neo5se_amfi_register);
++#endif /* ARM64_BOARD_CONFIG_NEO5SE */

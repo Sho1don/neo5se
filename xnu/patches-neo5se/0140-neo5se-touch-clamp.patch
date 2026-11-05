@@ -1,0 +1,50 @@
+xnu 0140: measure whether the part's IOVDD reaches its pads
+
+Every echo is still zeros with both framings at every AVDD/reset level, and
+the RPMh read-back only returns the vote, not the PMIC's output. Drive MISO
+high with the pad's own output stage and read it back: with no supply behind
+the part its ESD diode clamps the pin near 0.7 V, below the input threshold,
+and the read comes back 0; with IOVDD up it reads 1. Driving low is the
+control. That separates "the vote landed but the rail is not there" from
+"the rail is there and the part still will not talk".
+
+--- a/bsd/dev/neo5se_touch.c
++++ b/bsd/dev/neo5se_touch.c
+@@ -498,7 +498,8 @@
+ 		return -1;
+ 	}
+ 	idle = neo5se_tlmm_read(rsc, base + NEO5SE_RSC_CMD_ENABLE);
+-	printf("NEO5SE TOUCH: rpmh tcs0 enable 0x%x status 0x%x\n", idle,
++	printf("NEO5SE TOUCH: rpmh tcs%u enable 0x%x status 0x%x\n",
++	    NEO5SE_RSC_ACTIVE_TCS, idle,
+ 	    neo5se_tlmm_read(rsc, base + NEO5SE_RSC_STATUS));
+ 	neo5se_log_flush_now();
+ 	if (idle != 0) {
+@@ -841,6 +842,27 @@
+ 	 * so run it once per AVDD/reset level combination.
+ 	 */
+ 	(void)neo5se_touch_power_matrix();
++
++	/*
++	 * Does the part's IOVDD physically reach its pads? Drive MISO high with
++	 * the pad's own output stage and read it back: with no supply behind the
++	 * part, its ESD diode clamps the pin near 0.7 V, below the input
++	 * threshold, and the read comes back 0. With IOVDD up it reads 1.
++	 * Driving low is the control (always 0).
++	 */
++	neo5se_tlmm_write(neo5se_spi_miso, NEO5SE_TLMM_IN_OUT, 2);
++	neo5se_tlmm_write(neo5se_spi_miso, NEO5SE_TLMM_CFG,
++	    neo5se_tlmm_cfg(0, NEO5SE_TLMM_PULL_NONE, NEO5SE_TLMM_DRIVE_8MA, 1));
++	neo5se_spi_delay(2000);
++	printf("NEO5SE TOUCH: clamp miso driven high reads %u",
++	    neo5se_tlmm_read(neo5se_spi_miso, NEO5SE_TLMM_IN_OUT) & 1);
++	neo5se_tlmm_write(neo5se_spi_miso, NEO5SE_TLMM_IN_OUT, 0);
++	neo5se_spi_delay(2000);
++	printf(", driven low reads %u\n",
++	    neo5se_tlmm_read(neo5se_spi_miso, NEO5SE_TLMM_IN_OUT) & 1);
++	neo5se_log_flush_now();
++	neo5se_tlmm_write(neo5se_spi_miso, NEO5SE_TLMM_CFG,
++	    neo5se_tlmm_cfg(0, NEO5SE_TLMM_PULL_DOWN, NEO5SE_TLMM_DRIVE_2MA, 0));
+ }
+ 
+ void

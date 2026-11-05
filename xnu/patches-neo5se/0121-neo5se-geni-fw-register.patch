@@ -1,0 +1,75 @@
+xnu 0121: read the SE firmware at the register that exists
+
+0120 read SE_GENI_FW_REVISION at 0x1000, the newer GENI layout. On this SE
+that address is not there: the read wedges the interconnect (the console
+stopped right after the CLK_CTRL line and the watchdog reset the phone). The
+classic register is GENI_FW_REVISION_RO at 0x68, with the protocol in bits
+15-8; read that and SE_GENI_STATUS instead.
+
+Also check the SE clock root unconditionally: 0120 only touched the RCG when
+the first read found ROOT_OFF set, but the value is read again after the
+branch write, which can clear it. Print cmd/cfg after the writes so the next
+boot says whether the root is on.
+
+--- a/bsd/dev/neo5se_touch.c
++++ b/bsd/dev/neo5se_touch.c
+@@ -66,7 +66,8 @@
+ #define NEO5SE_SE_INIT_CFG_REV	0x0
+ #define NEO5SE_SE_CGC_CTRL		0x28
+ #define NEO5SE_SE_CLK_CTRL_RO		0x60
+-#define NEO5SE_SE_FW_REV		0x1000
++#define NEO5SE_SE_FW_REV		0x68
++#define NEO5SE_SE_STATUS		0x40
+ 
+ #define NEO5SE_TOUCH_RESET_GPIO	20
+ #define NEO5SE_TOUCH_IRQ_GPIO		21
+@@ -236,9 +237,14 @@
+ 	    neo5se_tlmm_read(gcc, NEO5SE_GCC_QUPV3_WRAP0_CBCR));
+ 	neo5se_log_flush_now();
+ 
+-	/* No SE clock root yet: pick the XO (19.2 MHz, source 0) with div 1. */
+-	if (neo5se_tlmm_read(gcc, NEO5SE_GCC_SE4_CMD_RCGR) & NEO5SE_GCC_RCG_ROOT_OFF) {
+-		cfg = neo5se_tlmm_read(gcc, NEO5SE_GCC_SE4_CFG_RCGR);
++	/* Root the SE clock on the XO (19.2 MHz, source 0) with divider 1. The
++	 * branch above may or may not have cleared ROOT_OFF; check and write. */
++	cmd = neo5se_tlmm_read(gcc, NEO5SE_GCC_SE4_CMD_RCGR);
++	cfg = neo5se_tlmm_read(gcc, NEO5SE_GCC_SE4_CFG_RCGR);
++	printf("NEO5SE TOUCH: geni: se4 cmd 0x%x cfg 0x%x after the branches\n",
++	    cmd, cfg);
++	neo5se_log_flush_now();
++	if (cmd & NEO5SE_GCC_RCG_ROOT_OFF) {
+ 		cfg &= ~0x1fu;          /* divider */
+ 		cfg &= ~0x700u;         /* source select */
+ 		neo5se_tlmm_write(gcc, NEO5SE_GCC_SE4_CFG_RCGR, cfg);
+@@ -253,11 +259,11 @@
+ 		neo5se_tlmm_write(gcc, NEO5SE_GCC_SE4_CMD_RCGR,
+ 		    cmd | NEO5SE_GCC_RCG_ROOT_EN);
+ 		delay(1000);
+-		printf("NEO5SE TOUCH: geni: se4 clock was off, cmd now 0x%x cfg 0x%x\n",
+-		    neo5se_tlmm_read(gcc, NEO5SE_GCC_SE4_CMD_RCGR),
+-		    neo5se_tlmm_read(gcc, NEO5SE_GCC_SE4_CFG_RCGR));
+-		neo5se_log_flush_now();
+-	}
++	}
++	printf("NEO5SE TOUCH: geni: se4 cmd now 0x%x cfg 0x%x\n",
++	    neo5se_tlmm_read(gcc, NEO5SE_GCC_SE4_CMD_RCGR),
++	    neo5se_tlmm_read(gcc, NEO5SE_GCC_SE4_CFG_RCGR));
++	neo5se_log_flush_now();
+ 
+ 	printf("NEO5SE TOUCH: geni: wrapper hw ver 0x%x\n",
+ 	    neo5se_tlmm_read(wrap, NEO5SE_QUPV3_HW_VER));
+@@ -272,6 +278,14 @@
+ 	printf("NEO5SE TOUCH: geni: se clk 0x%x\n",
+ 	    neo5se_tlmm_read(se, NEO5SE_SE_CLK_CTRL_RO));
+ 	neo5se_log_flush_now();
++	/*
++	 * FW_REVISION lives at 0x68 with the protocol in bits 15-8. Do not
++	 * read the 0x1000 alias of the newer GENI layout: on this SE that
++	 * address wedges the interconnect (measured on 0120).
++	 */
++	printf("NEO5SE TOUCH: geni: se status 0x%x\n",
++	    neo5se_tlmm_read(se, NEO5SE_SE_STATUS));
++	neo5se_log_flush_now();
+ 	printf("NEO5SE TOUCH: geni: se fw 0x%x\n",
+ 	    neo5se_tlmm_read(se, NEO5SE_SE_FW_REV));
+ 	neo5se_log_flush_now();

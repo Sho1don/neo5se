@@ -1,0 +1,353 @@
+xnu 0096: keep the console log on the phone
+
+The console only exists as pixels on the panel, and a boot writes several
+screens of log: whatever the interesting line is -- a crash, the process
+sampler, a driver's first error -- it is off the screen long before anybody
+can photograph it. This is the same answer neo5se has (its 0047), ported:
+every character that reaches the console is also kept in a 4 MiB ring in RAM,
+and a kernel thread rewrites the dirty blocks to the last 4 MiB + 4 KiB of
+userdata once every 5 s, flush included.
+
+The tee is in _cnputs(), so it catches kernel printf and the daemons' writes
+to /dev/console alike (and it is before the mute check, so a quiet screen
+still logs). Block 0 of the area is a header: "MONDLOG", u32 version, u32 ring
+size, u64 total bytes written, u64 flush sequence; byte n of the stream is at
+ring offset n % ring size. The area is behind the HFS image, which starts at
+the partition's first block.
+
+Read a previous boot by starting a dump kernel with boot-arg
+neo5sedump=1; it scans the ring and prints selected first/last matches before
+stopping. The shim log viewer is unreliable on this UFS host. Boot-arg
+neo5selog=0 turns persistence off.
+
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -270,6 +270,16 @@
+ _cnputs(char *c, int size, bool poll)
+ {
+ 	extern int disableConsoleOutput;
++
++#if defined(ARM64_BOARD_CONFIG_NEO5SE)
++	/*
++	 * Before the mute check, and so before the panel: the persistent log in
++	 * bsd/dev/neo5se_ufs.c is what a boot is read from, the screen is
++	 * only the immediate view. It never blocks.
++	 */
++	extern void neo5se_log_append(const char *c, int size);
++	neo5se_log_append(c, size);
++#endif
+ 
+ 	if (disableConsoleOutput) {
+ 		return;
+diff --git a/bsd/dev/neo5se_ufs.c b/bsd/dev/neo5se_ufs.c
+--- a/bsd/dev/neo5se_ufs.c
++++ b/bsd/dev/neo5se_ufs.c
+@@ -27,7 +27,9 @@
+ #include <sys/disk.h>
+ #include <sys/errno.h>
+ #include <sys/proc.h>
++#include <sys/systm.h>
+ #include <sys/uio.h>
++#include <machine/atomic.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+@@ -46,6 +48,9 @@
+  * GIC actually look like on this phone. */
+ extern void pe_neo5se_gic_dump(void);
+ extern void neo5se_irq_dump(void);
++extern int hz;
++static void neo5se_log_start(void);
++static void neo5se_log_dump(uint32_t lines);
+ 
+ #define REG_CAP          0x00
+ #define REG_VER          0x08
+@@ -1076,6 +1081,14 @@
+ 	su.ready = true;
+ 	printf("NEO5SE UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, read/write\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20);
++	{
++		uint32_t dump = 0;
++
++		if (PE_parse_boot_argn("neo5sedump", &dump, sizeof(dump)) && dump != 0) {
++			neo5se_log_dump(dump);        /* does not return */
++		}
++	}
++	neo5se_log_start();
+ 	neo5se_sample_start();
+ 	return 0;
+ }
+@@ -1095,5 +1108,272 @@
+ 	*dev = su.bdev;
+ 	neo5se_sample_start();        /* retry if the early start failed */
+ 	return 0;
++}
++
++/*
++ * Persistent console log ("neo5selog"). A photo of the panel is the only
++ * other way to read a boot, and it shows one screenful of a log that is chatty
++ * enough to push the lines that matter off it. So every character that reaches
++ * the console -- kernel printf and the daemons' /dev/console writes, both
++ * through _cnputs -- is also kept in a 4 MiB ring in RAM, and once the
++ * partition is known a thread copies the new blocks to the LAST 4 MiB + 4 KiB
++ * of userdata, far behind the HFS image at its start. Device block 0 of that
++ * area is a header:
++ *
++ *   "MONDLOG" | u32 version 1 | u32 ring size | u64 total bytes written
++ *   | u64 flush sequence
++ *
++ * and byte n of the console stream is at ring offset n % ring size. Read a
++ * previous boot with a dump kernel (`neo5sedump=1`), which prints selected
++ * first/last matches before stopping. The shim log viewer is unreliable on
++ * this UFS host. Boot-arg neo5selog=0 turns persistence off.
++ */
++#define NEO5SE_LOG_SIZE       (4u << 20)
++#define NEO5SE_LOG_BLOCKS     (1 + NEO5SE_LOG_SIZE / UFS_BLOCK)
++#define NEO5SE_LOG_TICKS      5
++
++static char neo5se_log_ring[NEO5SE_LOG_SIZE];
++static uint64_t _Atomic neo5se_log_total;
++static int neo5se_log_chan;
++
++/* Called for every console character, in any context: never blocks. */
++void
++neo5se_log_append(const char *c, int size)
++{
++	uint64_t at;
++
++	if (size <= 0) {
++		return;
++	}
++	at = os_atomic_add_orig(&neo5se_log_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		neo5se_log_ring[(at + (uint64_t)i) % NEO5SE_LOG_SIZE] = c[i];
++	}
++}
++
++struct neo5se_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++static void
++neo5se_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t base = su.first_block + su.nblocks - NEO5SE_LOG_BLOCKS;
++	uint64_t flushed = 0, seq = 0;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++
++	printf("NEO5SE LOG: console ring in the last %u KiB of the partition (block 0x%llx)\n",
++	    NEO5SE_LOG_BLOCKS * UFS_BLOCK >> 10, base);
++	for (;;) {
++		uint64_t total, pos;
++		int error = 0;
++
++		(void)tsleep(&neo5se_log_chan, PZERO, "neo5selog", NEO5SE_LOG_TICKS * hz);
++		total = os_atomic_load(&neo5se_log_total, relaxed);
++		if (total == flushed) {
++			continue;
++		}
++		/*
++		 * Write whole device blocks, from the first block that holds
++		 * unflushed data: a partial block would lose the bytes that
++		 * follow it, and the ring is not block aligned.
++		 */
++		pos = (total - flushed >= NEO5SE_LOG_SIZE) ? total - NEO5SE_LOG_SIZE : flushed;
++		lck_mtx_lock(&neo5se_ufs_lock);
++		while (pos < total && !error) {
++			uint32_t off = (uint32_t)(pos % NEO5SE_LOG_SIZE);
++			uint32_t blk = off / UFS_BLOCK;
++			uint64_t need = ((uint64_t)(off % UFS_BLOCK) + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(NEO5SE_LOG_SIZE / UFS_BLOCK - blk)),
++			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++
++			memcpy(bounce, neo5se_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++			error = ufs_write_blocks(base + 1 + blk, n);
++			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++		}
++		if (!error) {
++			struct neo5se_log_header h = {
++				.magic = { 'M', 'O', 'N', 'D', 'L', 'O', 'G' },
++				.version = 1, .size = NEO5SE_LOG_SIZE, .total = total, .seq = ++seq
++			};
++
++			bzero(bounce, UFS_BLOCK);
++			memcpy(bounce, &h, sizeof(h));
++			error = ufs_write_blocks(base, 1);
++		}
++		if (!error) {
++			error = ufs_flush();
++		}
++		lck_mtx_unlock(&neo5se_ufs_lock);
++		if (error) {
++			printf("NEO5SE LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++/* Does the line contain `want`? strstr(a,b) drawn at home. */
++static bool
++neo5se_log_contains(const char *line, const char *want)
++{
++	size_t n = strlen(want);
++
++	if (n == 0) {
++		return true;
++	}
++	for (; *line != 0; line++) {
++		if (strncmp(line, want, n) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
++ * Boot-arg neo5sedump=N (N>0 turns it on) with neo5sedumpmatch=a,b,c (up
++ * to four terms, default "SMP"): count the lines of the PREVIOUS boot's
++ * console log that contain each term and print the first and the last of each,
++ * then stop the boot there.
++ *
++ * The log runs at hundreds of lines a second, so "the last forty lines" is a
++ * tenth of a second of it, and the question is never "what was the last line"
++ * but "did this ever happen, and where was it". A count and the newest match
++ * answer that in a few lines that survive being read off a screen.
++ */
++static void
++neo5se_log_dump(uint32_t lines)
++{
++	static char text[NEO5SE_LOG_SIZE + 1];
++	static char first[4][80], last[4][80];
++	static uint32_t hits[4];
++	char terms[128] = "SMP";
++	char *term[4];
++	uint32_t nterms = 0, nlines = 0, got = 0, have, ring;
++	uint64_t base = su.first_block + su.nblocks - NEO5SE_LOG_BLOCKS;
++	uint64_t total, pos;
++	char *h = (char *)(su.dma + DMA_BOUNCE);
++
++	if (lines == 0) {
++		return;
++	}
++	if (ufs_read_blocks(base, 1)) {
++		printf("NEO5SEDUMP: header read failed\n");
++		return;
++	}
++	if (memcmp(h, "MONDLOG", 7) != 0) {
++		printf("NEO5SEDUMP: no MONDLOG header (the log never flushed)\n");
++		return;
++	}
++	ring = *(uint32_t *)(h + 12);
++	total = *(uint64_t *)(h + 16);
++	if (ring == 0 || ring > NEO5SE_LOG_SIZE || total == 0) {
++		printf("NEO5SEDUMP: empty or bad ring\n");
++		return;
++	}
++
++	/* The terms. */
++	(void)PE_parse_boot_argn("neo5sedumpmatch", terms, sizeof(terms));
++	for (char *t = terms; *t != 0 && nterms < 4; ) {
++		char *end = strchr(t, ',');
++		size_t len = end ? (size_t)(end - t) : strlen(t);
++
++		if (len > 0) {
++			char save = t[len];
++
++			t[len] = 0;
++			term[nterms++] = t;
++			t[len] = save;
++		}
++		t = end ? end + 1 : t + len;
++	}
++
++	/* The whole ring: a filtered window has to be minutes wide. */
++	have = total < ring ? (uint32_t)total : ring;
++	if (have > NEO5SE_LOG_SIZE) {
++		have = NEO5SE_LOG_SIZE;
++	}
++	pos = (total % ring + ring - have) % ring;
++	uint32_t const per_read = BOUNCE_SIZE / UFS_BLOCK;
++	while (got < have) {
++		uint32_t off = (uint32_t)(pos % ring);
++		uint32_t n = MIN(have - got, ring - off);
++		uint32_t blocks = (off % UFS_BLOCK + n + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t skip = off % UFS_BLOCK;
++
++		if (blocks > per_read) {
++			blocks = per_read;
++		}
++		if (ufs_read_blocks(base + 1 + off / UFS_BLOCK, blocks)) {
++			printf("NEO5SEDUMP: read failed at ring offset %u\n", off);
++			break;
++		}
++		n = MIN(n, blocks * UFS_BLOCK - skip);
++		memcpy(text + got, (char *)(su.dma + DMA_BOUNCE) + skip, n);
++		got += n;
++		pos = (pos + n) % ring;
++	}
++	text[got] = 0;
++
++	for (char *c = text, *start = text; ; c++) {
++		if (*c != '\n' && *c != 0) {
++			continue;
++		}
++		char stop = *c;
++
++		*c = 0;
++		if (c > start) {
++			nlines++;
++			for (uint32_t t = 0; t < nterms; t++) {
++				if (!neo5se_log_contains(start, term[t])) {
++					continue;
++				}
++				hits[t]++;
++				if (first[t][0] == 0) {
++					snprintf(first[t], sizeof(first[t]), "%s", start);
++				}
++				snprintf(last[t], sizeof(last[t]), "%s", start);
++			}
++		}
++		if (stop == 0) {
++			break;
++		}
++		start = c + 1;
++	}
++
++	printf("NEO5SEDUMP: %u lines, %llu bytes written, ring %u\n", nlines, total, ring);
++	for (uint32_t t = 0; t < nterms; t++) {
++		printf("NEO5SEDUMP: \"%s\" %u hits\n", term[t], hits[t]);
++		if (hits[t] != 0) {
++			printf("  first | %s\n", first[t]);
++			printf("  last  | %s\n", last[t]);
++		}
++	}
++	printf("NEO5SEDUMP: end\n");
++	for (;;) {
++		delay(1000);
++	}
+ }
++
++static void
++neo5se_log_start(void)
++{
++	static int started;
++	uint32_t on = 1;
++	thread_t thread;
++
++	if (started || !su.ready) {
++		return;
++	}
++	PE_parse_boot_argn("neo5selog", &on, sizeof(on));
++	if (!on || su.nblocks < 2 * NEO5SE_LOG_BLOCKS) {
++		return;
++	}
++	if (kernel_thread_start(neo5se_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		started = 1;
++		thread_deallocate(thread);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_NEO5SE */

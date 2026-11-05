@@ -1,0 +1,131 @@
+xnu 0097: start the persistent console log after root mount
+
+The first log-reader boots found no MONDLOG header even though userdata was
+writable. Start the writer only after BSD has mounted and installed the root
+vnode, flush immediately instead of sleeping first, and verify the initial
+header by reading it back after SYNCHRONIZE CACHE. This distinguishes a thread
+startup problem from a UFS write or cache-flush failure before launchd starts.
+
+diff --git a/bsd/dev/neo5se_ufs.c b/bsd/dev/neo5se_ufs.c
+--- a/bsd/dev/neo5se_ufs.c
++++ b/bsd/dev/neo5se_ufs.c
+@@ -49,5 +49,5 @@
+ extern void pe_neo5se_gic_dump(void);
+ extern void neo5se_irq_dump(void);
+ extern int hz;
+-static void neo5se_log_start(void);
++void neo5se_log_start(void);
+ static void neo5se_log_dump(uint32_t lines);
+@@ -1088,7 +1088,6 @@
+ 			neo5se_log_dump(dump);        /* does not return */
+ 		}
+ 	}
+-	neo5se_log_start();
+ 	neo5se_sample_start();
+ 	return 0;
+ }
+@@ -1163,6 +1162,7 @@
+ 	uint64_t base = su.first_block + su.nblocks - NEO5SE_LOG_BLOCKS;
+ 	uint64_t flushed = 0, seq = 0;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	bool first_flush = true, verified = false;
+ 
+ 	printf("NEO5SE LOG: console ring in the last %u KiB of the partition (block 0x%llx)\n",
+ 	    NEO5SE_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+@@ -1170,11 +1170,18 @@
+ 		uint64_t total, pos;
+ 		int error = 0;
+ 
+-		(void)tsleep(&neo5se_log_chan, PZERO, "neo5selog", NEO5SE_LOG_TICKS * hz);
++		if (!first_flush) {
++			(void)tsleep(&neo5se_log_chan, PZERO, "neo5selog", NEO5SE_LOG_TICKS * hz);
++		}
++		first_flush = false;
+ 		total = os_atomic_load(&neo5se_log_total, relaxed);
+ 		if (total == flushed) {
+ 			continue;
+ 		}
++		struct neo5se_log_header h = {
++			.magic = { 'M', 'O', 'N', 'D', 'L', 'O', 'G' },
++			.version = 1, .size = NEO5SE_LOG_SIZE, .total = total, .seq = ++seq
++		};
+ 		/*
+ 		 * Write whole device blocks, from the first block that holds
+ 		 * unflushed data: a partial block would lose the bytes that
+@@ -1194,11 +1201,6 @@
+ 			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+ 		}
+ 		if (!error) {
+-			struct neo5se_log_header h = {
+-				.magic = { 'M', 'O', 'N', 'D', 'L', 'O', 'G' },
+-				.version = 1, .size = NEO5SE_LOG_SIZE, .total = total, .seq = ++seq
+-			};
+-
+ 			bzero(bounce, UFS_BLOCK);
+ 			memcpy(bounce, &h, sizeof(h));
+ 			error = ufs_write_blocks(base, 1);
+@@ -1206,9 +1208,21 @@
+ 		if (!error) {
+ 			error = ufs_flush();
+ 		}
++		if (!error && !verified) {
++			error = ufs_read_blocks(base, 1);
++			if (!error && memcmp(bounce, &h, sizeof(h)) != 0) {
++				error = EIO;
++			}
++			if (!error) {
++				verified = true;
++				printf("NEO5SE LOG: initial header verified (total %llu, seq %llu)\n",
++				    total, h.seq);
++			}
++		}
+ 		lck_mtx_unlock(&neo5se_ufs_lock);
+ 		if (error) {
+-			printf("NEO5SE LOG: write failed (%d), stopping\n", error);
++			printf("NEO5SE LOG: flush failed at total %llu (%d), stopping\n",
++			    total, error);
+ 			return;
+ 		}
+ 		flushed = total;
+@@ -1360,19 +1374,24 @@
+-static void
++void
+ neo5se_log_start(void)
+ {
+ 	static int started;
+ 	uint32_t on = 1;
+ 	thread_t thread;
++	kern_return_t kr;
+ 
+ 	if (started || !su.ready) {
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("neo5selog", &on, sizeof(on));
+ 	if (!on || su.nblocks < 2 * NEO5SE_LOG_BLOCKS) {
+ 		return;
+ 	}
+-	if (kernel_thread_start(neo5se_log_thread, NULL, &thread) == KERN_SUCCESS) {
++	kr = kernel_thread_start(neo5se_log_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
+ 		started = 1;
+ 		thread_deallocate(thread);
++		printf("NEO5SE LOG: writer thread started\n");
++	} else {
++		printf("NEO5SE LOG: writer thread start failed (%d)\n", kr);
+ 	}
+ }
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -940,6 +940,11 @@
+ 	lck_rw_unlock_exclusive(&rootvnode_rw_lock);
+ 	init_rootvnode = NULLVP;  /* use rootvnode after this point */
+ 
++#if defined(ARM64_BOARD_CONFIG_NEO5SE)
++	/* Start persistent console writes only after userdata is the mounted root. */
++	extern void neo5se_log_start(void);
++	neo5se_log_start();
++#endif
+ 
+ 	if (!bsd_rooted_ramdisk()) {
+ 		boolean_t require_rootauth = FALSE;

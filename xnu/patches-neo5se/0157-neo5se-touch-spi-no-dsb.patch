@@ -1,0 +1,78 @@
+xnu 0157: no DSB in the touch bit-bang
+
+Every TLMM access in the SPI loop is followed by a DSB SY, four per bit.
+The barrier drains the interconnect and costs microseconds on this SoC,
+and it is most of the two seconds that a 4 KB firmware packet takes.
+These MMIO pages are device memory (nGnRnE), so the accesses are already
+ordered; drop the barrier in the bit loop only and keep it in the pin,
+power and RPMh paths. The load should fall from minutes to seconds, so
+the touch is ready when the UI appears instead of two minutes later.
+--- a/bsd/dev/neo5se_touch.c
++++ b/bsd/dev/neo5se_touch.c
+@@ -208,6 +208,26 @@
+ {
+ 	*(volatile uint32_t *)(page + off) = value;
+ 	__builtin_arm_dsb(0xf);
++}
++
++/*
++ * The bit-bang path makes four accesses per bit, and a DSB SY after each one
++ * drains the interconnect for nothing: these MMIO pages are device memory
++ * (nGnRnE), so the accesses are already ordered. (The two-minute load was the
++ * delay conversion of 0156, not this barrier.) Keep the barrier everywhere
++ * else (pin setup, power, RPMh), where a stale write could mean the wrong pad
++ * state.
++ */
++static uint32_t
++neo5se_tlmm_read_raw(vm_offset_t page, uint32_t off)
++{
++	return *(volatile uint32_t *)(page + off);
++}
++
++static void
++neo5se_tlmm_write_raw(vm_offset_t page, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(page + off) = value;
+ }
+ 
+ static uint32_t
+@@ -672,16 +692,16 @@
+ {
+ 	int miso;
+ 
+-	neo5se_tlmm_write(neo5se_spi_mosi, NEO5SE_TLMM_IN_OUT, mosi ? 2 : 0);
++	neo5se_tlmm_write_raw(neo5se_spi_mosi, NEO5SE_TLMM_IN_OUT, mosi ? 2 : 0);
+ 	neo5se_spi_delay(neo5se_spi_half);
+-	neo5se_tlmm_write(neo5se_spi_clk, NEO5SE_TLMM_IN_OUT, 2);
++	neo5se_tlmm_write_raw(neo5se_spi_clk, NEO5SE_TLMM_IN_OUT, 2);
+ 	neo5se_spi_delay(neo5se_spi_half);
+ 	if (neo5se_spi_fall) {
+-		neo5se_tlmm_write(neo5se_spi_clk, NEO5SE_TLMM_IN_OUT, 0);
++		neo5se_tlmm_write_raw(neo5se_spi_clk, NEO5SE_TLMM_IN_OUT, 0);
+ 		neo5se_spi_delay(neo5se_spi_half);
+ 	}
+-	miso = (int)(neo5se_tlmm_read(neo5se_spi_miso, NEO5SE_TLMM_IN_OUT) & 1);
+-	neo5se_tlmm_write(neo5se_spi_clk, NEO5SE_TLMM_IN_OUT, 0);
++	miso = (int)(neo5se_tlmm_read_raw(neo5se_spi_miso, NEO5SE_TLMM_IN_OUT) & 1);
++	neo5se_tlmm_write_raw(neo5se_spi_clk, NEO5SE_TLMM_IN_OUT, 0);
+ 	neo5se_spi_delay(neo5se_spi_half);
+ 	return miso;
+ }
+@@ -696,7 +716,7 @@
+ 	 * Everything in one CS frame: the part latches the prefix and drives
+ 	 * MISO for the following clocks with CS still low.
+ 	 */
+-	neo5se_tlmm_write(neo5se_spi_cs, NEO5SE_TLMM_IN_OUT, 0);   /* CS low */
++	neo5se_tlmm_write_raw(neo5se_spi_cs, NEO5SE_TLMM_IN_OUT, 0);  /* CS low */
+ 	neo5se_spi_delay(2000);
+ 	neo5se_spi_frame_start = mach_absolute_time();
+ 	for (i = 0; i < txlen; i++) {
+@@ -712,7 +732,7 @@
+ 		rx[i] = in;
+ 	}
+ 	neo5se_spi_delay(2000);
+-	neo5se_tlmm_write(neo5se_spi_cs, NEO5SE_TLMM_IN_OUT, 2);   /* CS high */
++	neo5se_tlmm_write_raw(neo5se_spi_cs, NEO5SE_TLMM_IN_OUT, 2); /* CS high */
+ 	neo5se_spi_delay(2000);
+ 	neo5se_spi_frame_ticks = mach_absolute_time() - neo5se_spi_frame_start;
+ 	return 0;

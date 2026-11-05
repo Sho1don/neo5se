@@ -1,0 +1,425 @@
+xnu 0116: say whether the timer interrupt ever leaves the timer
+
+Every timed wait on this board hangs: the sampler thread's tsleep() never
+wakes, the timer beacon is never painted, and userland's usleep() never
+returns (which is also why _detectDisplays never does). The timer is armed
+(CNTV_CTL reads ENABLE, CVAL sits just ahead of CNTVCT), so the question is
+where the interrupt is lost.
+
+End and drop the PPI before enabling it -- an interrupt the loader left active
+can never be taken again -- and clear its Group 1 secure modifier, which would
+keep it away from EL1 entirely. That makes the timer deliver: the beacon in
+the timer interrupt counts up and every timed wait returns. Print the timer
+interrupt count, DAIF and the CPU interface's group/priority mask with the
+CNTV registers, print the GIC and IRQ dumps with printf instead of kprintf so
+the panel and the ring see them, and wake the ring every 8 KiB so those lines
+arrive during boot instead of once.
+
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -24,6 +24,7 @@
+ 
+ static vm_offset_t gicd_base;
+ static vm_offset_t gicr_base;
++static vm_offset_t neo5se_gicr_pe;
+ static vm_offset_t gicr_size;
+ 
+ #if defined(NEO5SE)
+@@ -45,6 +46,7 @@
+ static uint32_t neo5se_vtimer_pending_state;
+ static uint32_t neo5se_vtimer_active_state;
+ static uint32_t neo5se_vtimer_group_state;
++static uint32_t neo5se_vtimer_mod_state;
+ #endif
+ 
+ static uint32_t
+@@ -118,6 +120,8 @@
+ 	if (!gicr_base) {
+ 		panic("%s: cannot remap GICR region", __func__);
+ 	}
++	/* The per-CPU frame pointer is into the mapping above, not the old one. */
++	neo5se_gicr_pe = find_gicr_pe_base();
+ 	printf("NEO5SE GIC: gicd %llx+%llx -> %llx, gicr %llx+%llx -> %llx\n",
+ 	    (unsigned long long)neo5se_gicd_phys, (unsigned long long)neo5se_gicd_size,
+ 	    (unsigned long long)gicd_base,
+@@ -132,10 +136,10 @@
+ 	if (!gicd_base) {
+ 		return;
+ 	}
+-	kprintf("NEO5SE GIC: early vtimer PPI %u enable=%x pending=%x active=%x group=%x\n",
++	printf("NEO5SE GIC: early vtimer PPI %u enable=%x pending=%x active=%x group=%x mod=%x\n",
+ 	    neo5se_vtimer_intid, neo5se_vtimer_enable_state,
+ 	    neo5se_vtimer_pending_state, neo5se_vtimer_active_state,
+-	    neo5se_vtimer_group_state);
++	    neo5se_vtimer_group_state, neo5se_vtimer_mod_state);
+ 	/*
+ 	 * Read only the first redistributor page. GICR_IGROUPR0 lives in the
+ 	 * SGI page (GICR base + 0x10080) and reading it *after* the VM is up
+@@ -147,7 +151,7 @@
+ 	 * the remap above is for -- and it has never faulted.
+ 	 */
+ 	uint64_t typer = *(volatile uint64_t *)(gicr_base + GICR_TYPER);
+-	kprintf("NEO5SE GIC: vtimer %u gicr typer=%llx timer_pending=%d\n",
++	printf("NEO5SE GIC: vtimer %u gicr typer=%llx timer_pending=%d\n",
+ 	    neo5se_vtimer_intid, (unsigned long long)typer,
+ 	    ml_get_timer_pending());
+ }
+@@ -243,6 +247,7 @@
+ 
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++	neo5se_gicr_pe = gicr_pe_base;
+ 
+ 	// Mark this PE to be awake
+ 	uint32_t gicr_waker = gicr_read32(GICR_WAKER);
+@@ -270,6 +275,17 @@
+ 	 * from the non-secure side even after this write; delivery still works.
+ 	 */
+ 	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
++	/*
++	 * An interrupt the loader left active can never be taken again (with
++	 * EOImode 0 only an end-of-interrupt clears it), and one left in
++	 * Group 1 secure never reaches EL1 at all. End it, drop it and clear
++	 * the group modifier before enabling it, the way the HakiOS port does.
++	 */
++	gicr_write32(GICR_ICACTIVER0, (1U << neo5se_vtimer_intid) | (1U << NEO5SE_IPI_SGI));
++	gicr_write32(GICR_ICPENDR0, (1U << neo5se_vtimer_intid) | (1U << NEO5SE_IPI_SGI));
++	gicr_write32(GICR_IGRPMODR0, gicr_read32(GICR_IGRPMODR0) &
++	    ~((1U << neo5se_vtimer_intid) | (1U << NEO5SE_IPI_SGI)));
++	__builtin_arm_wsr64("ICC_AP1R0_EL1", 0);
+ 	for (unsigned int i = 0; i < 32; i += 4) {
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+@@ -279,6 +295,7 @@
+ 	neo5se_vtimer_pending_state = gicr_read32(GICR_ISPENDR0);
+ 	neo5se_vtimer_active_state = gicr_read32(GICR_ISACTIVER0);
+ 	neo5se_vtimer_group_state = gicr_read32(GICR_IGROUPR0);
++	neo5se_vtimer_mod_state = gicr_read32(GICR_IGRPMODR0);
+ 	/*
+ 	 * Which group is the timer PPI in? Group 0 belongs to TrustZone and
+ 	 * is not forwarded to this CPU (GICD_CTLR only has the Group 1 bits
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -941,7 +941,26 @@
+  * means the CPU is stuck; the PC it shows says where. No locks, no
+  * allocation: this runs in interrupt context.
+  */
++/* Set when the UI owns the screen: stop painting the beacon over it. */
++int neo5se_fbcon_quiet;
++
++/* A square of colour on the panel, for a liveness mark that must not print. */
+ void
++neo5se_fbcon_square(uint32_t x, uint32_t y, uint32_t size, uint32_t color)
++{
++	if (fbcon_base == NULL || x + size > fbcon_width || y + size > fbcon_height) {
++		return;
++	}
++	for (uint32_t row = 0; row < size; row++) {
++		volatile uint32_t *line = fbcon_base + (y + row) * (fbcon_stride / 4) + x;
++
++		for (uint32_t col = 0; col < size; col++) {
++			line[col] = color;
++		}
++	}
++}
++
++void
+ neo5se_fbcon_beacon(uint64_t pc, uint64_t count)
+ {
+ 	static const char hexd[] = "0123456789abcdef";
+@@ -949,7 +968,7 @@
+ 	unsigned int n = 0;
+ 	uint32_t row;
+ 
+-	if (fbcon_base == NULL || fbcon_rows < 8) {
++	if (fbcon_base == NULL || fbcon_rows < 8 || neo5se_fbcon_quiet) {
+ 		return;
+ 	}
+ 	/* A fixed row: the beacon stays where it is, so a photo shows it
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -56,6 +56,8 @@
+ 
+ kern_return_t serial_irq_enable(serial_device_t device);
+ void neo5se_fbcon_beacon(uint64_t pc, uint64_t count);
++void neo5se_fbcon_square(uint32_t x, uint32_t y, uint32_t size, uint32_t color);
++extern int neo5se_fbcon_quiet;
+ /* The panel's memory, which the page allocator must not hand out. */
+ uint64_t neo5se_fb_reserved_start(void);
+ uint64_t neo5se_fb_reserved_end(void);
+--- a/pexpert/pexpert/arm64/NEO5SE.h
++++ b/pexpert/pexpert/arm64/NEO5SE.h
+@@ -78,9 +78,12 @@
+ #define GICR_WAKER                              0x14
+ #define GICR_IGROUPR0                           0x10080
+ #define GICR_ISENABLER0                         0x10100
++#define GICR_ICPENDR0                           0x10280
+ #define GICR_ISPENDR0                           0x10200
+ #define GICR_ISACTIVER0                         0x10300
++#define GICR_ICACTIVER0                         0x10380
+ #define GICR_IPRIORITYR0                        0x10400
++#define GICR_IGRPMODR0                          0x10d00
+ 
+ #define GICR_TYPER_AFFINITY_VALUE_SHIFT         32
+ #define GICR_TYPER_LAST                         0x10
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1878,6 +1878,8 @@
+  * the timer ever interrupted. */
+ static uint32_t neo5se_intids[8];
+ static unsigned int neo5se_intid_n;
++static uint64_t neo5se_irq_count;
++static uint64_t neo5se_last_irq_pc;
+ #endif
+ 
+ /*
+@@ -1889,12 +1891,35 @@
+ neo5se_irq_dump(void)
+ {
+ #if defined(NEO5SE)
++	/* printf, not kprintf: the ring and the panel only see the former. */
++	printf("NEO5SE IRQ: timer %llu irqs, %u intids seen\n",
++	    (unsigned long long)neo5se_irq_count, neo5se_intid_n < 8 ? neo5se_intid_n : 8);
+ 	for (unsigned int i = 0; i < 8; i++) {
+-		kprintf("NEO5SE IRQ: %u intid %u\n", i, neo5se_intids[(neo5se_intid_n + i) % 8]);
++		printf("NEO5SE IRQ: %u intid %u\n", i, neo5se_intids[(neo5se_intid_n + i) % 8]);
+ 	}
+ #endif
+ }
+ 
++uint64_t
++neo5se_timer_irqs(void)
++{
++#if defined(NEO5SE)
++	return neo5se_irq_count;
++#else
++	return 0;
++#endif
++}
++
++uint64_t
++neo5se_timer_last_pc(void)
++{
++#if defined(NEO5SE)
++	return neo5se_last_irq_pc;
++#else
++	return 0;
++#endif
++}
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1909,7 +1934,6 @@
+ 	 * neo5se: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
+-	static uint64_t neo5se_irq_count;
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ 
+@@ -1928,6 +1952,7 @@
+ 		 * the screen is alive, and the PC it shows is where the CPU
+ 		 * was; if it stops, the CPU is stuck.
+ 		 */
++		neo5se_last_irq_pc = get_saved_state_pc(state);
+ 		if ((++neo5se_irq_count & 0x3) == 0) {
+ 			neo5se_fbcon_beacon(get_saved_state_pc(state), neo5se_irq_count);
+ 		}
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1020,7 +1020,7 @@
+ }
+ 
+ #define NEO5SE_DUMP_THREADS   8
+-#define NEO5SE_DUMP_BT        8
++#define NEO5SE_DUMP_BT        20
+ 
+ struct neo5se_thread_dump {
+ 	uint64_t pc;
+@@ -1086,7 +1086,7 @@
+ 	 */
+ 	printf("SMP %s threads %d shown %d\n", name, threads, shown);
+ 	for (int j = 0; j < shown; j++) {
+-		char line[320];
++		char line[640];
+ 		int n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt",
+ 		    name, j, dump[j].pc, dump[j].lr, dump[j].sp);
+ 
+--- a/osfmk/prng/prng_random.c
++++ b/osfmk/prng/prng_random.c
+@@ -236,7 +236,14 @@
+ 	size_t nbytes = sizeof(entropy);
+ 	int32_t nsamples = neo5se_getentropy(&nbytes, entropy, neo5se_getentropy_arg);
+ 	if (nsamples < 0) {
+-		panic("NEO5SE PRNG entropy health test failed");
++		/*
++		 * This board has no entropy source for the DRBG (no Apple SPU,
++		 * no corecrypto kext). A failed health test must not panic the
++		 * boot: keep generating from the seed the boot loader gave us.
++		 */
++		cc_clear(sizeof(entropy), entropy);
++		lck_mtx_unlock(&neo5se_prng_lock);
++		return;
+ 	}
+ 	if (nsamples >= 256) {
+ 		assert(nbytes >= SEED_SIZE && nbytes <= sizeof(entropy));
+--- a/bsd/dev/neo5se_sample.c
++++ b/bsd/dev/neo5se_sample.c
+@@ -176,6 +176,27 @@
+ 	static bool armed, dumped;
+ 	uint64_t now;
+ 
++	/*
++	 * neo5sesampleblind=1: do not print at all, just move a coloured
++	 * square. The console can wedge and take every printf with it; this
++	 * mark is drawn straight into the panel and says whether the kernel
++	 * still runs.
++	 */
++	{
++		static int blind = -1;
++
++		if (blind < 0) {
++			blind = 0;
++			(void)PE_parse_boot_argn("neo5sesampleblind", &blind, sizeof(blind));
++		}
++		if (blind != 0) {
++			static uint32_t phase;
++			extern void neo5se_fbcon_square(uint32_t x, uint32_t y, uint32_t size, uint32_t color);
++
++			neo5se_fbcon_square(320, (phase++ & 1) ? 300 : 380, 48, 0x0000ff00);
++			return;
++		}
++	}
+ 	if (!armed) {
+ 		armed = true;
+ 		neo5se_parse_names();
+@@ -215,6 +236,8 @@
+ 	}
+ 	printf("\n");
+ 	{
++		extern uint64_t neo5se_timer_irqs(void);
++		extern uint64_t neo5se_timer_last_pc(void);
+ 		static uint64_t previous_count;
+ 		static uint32_t snapshots;
+ 		uint64_t control = __builtin_arm_rsr64("CNTV_CTL_EL0");
+@@ -222,13 +245,22 @@
+ 		uint64_t count = __builtin_arm_rsr64("CNTVCT_EL0");
+ 		uint64_t delta = snapshots != 0 ? count - previous_count : 0;
+ 
+-		/* CNTV_CTL_EL0 bit 1 is architecturally IMASK; log readback, don't infer. */
+-		if (snapshots < 16 || (snapshots & 15) == 0) {
+-			printf("NEO5SE TIMER: sample %u ctl 0x%llx cval 0x%llx cntvct 0x%llx delta 0x%llx\n",
+-			    snapshots, (unsigned long long)control,
+-			    (unsigned long long)compare, (unsigned long long)count,
+-			    (unsigned long long)delta);
+-		}
++		/*
++		 * CNTV_CTL_EL0 bit 1 is IMASK and bit 2 is ISTATUS. The GIC
++		 * byte says whether the PPI is pending (1) or active (2), and
++		 * the count says whether the CPU ever took the interrupt: the
++		 * three together separate "not armed", "armed but masked",
++		 * "GIC never saw it" and "taken".
++		 */
++		printf("NEO5SE TIMER: sample %u ctl 0x%llx cval 0x%llx cntvct 0x%llx delta 0x%llx pc 0x%llx irqs %llu daif 0x%llx grp 0x%llx pmr 0x%llx\n",
++		    snapshots, (unsigned long long)control,
++		    (unsigned long long)compare, (unsigned long long)count,
++		    (unsigned long long)delta,
++		    (unsigned long long)neo5se_timer_last_pc(),
++		    (unsigned long long)neo5se_timer_irqs(),
++		    (unsigned long long)__builtin_arm_rsr64("DAIF"),
++		    (unsigned long long)__builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
++		    (unsigned long long)__builtin_arm_rsr64("ICC_PMR_EL1"));
+ 		previous_count = count;
+ 		snapshots++;
+ 	}
+@@ -255,11 +287,35 @@
+ 			}
+ 		}
+ 	}
+-	if (!dumped && neo5se_proc_count > 20 && target_present) {
+-		dumped = true;
+-		printf("SMP --- detailed sample, %d procs\n", neo5se_proc_count);
+-		proc_iterate(PROC_ALLPROCLIST, neo5se_sample_proc, NULL, NULL, NULL);
++	/*
++	 * The first dump catches the daemons while they load; the later ones,
++	 * once a minute, catch them in whatever they settle into (the boot
++	 * stops at the Apple logo long after the first one).
++	 */
++	{
++		static uint64_t last_dump;
++		static int dumps;
++
++		if (!dumped && neo5se_proc_count > 20 && target_present) {
++			dumped = true;
++			last_dump = now;
++			dumps = 1;
++			printf("SMP --- detailed sample 1, %d procs\n", neo5se_proc_count);
++			proc_iterate(PROC_ALLPROCLIST, neo5se_sample_proc, NULL, NULL, NULL);
++		} else if (dumped && target_present && neo5se_proc_count > 20 && dumps < 6 &&
++		    now - last_dump >= 60000000000ULL) {
++			last_dump = now;
++			dumps++;
++			printf("SMP --- detailed sample %d at t=%llus, %d procs\n", dumps,
++			    (unsigned long long)(now / 1000000000ULL), neo5se_proc_count);
++			proc_iterate(PROC_ALLPROCLIST, neo5se_sample_proc, NULL, NULL, NULL);
++		}
+ 	}
++	{
++		extern void neo5se_log_flush_now(void);
++
++		neo5se_log_flush_now();
++	}
+ 	neo5se_in_tick = 0;
+ }
+ 
+--- a/bsd/dev/neo5se_ufs.c
++++ b/bsd/dev/neo5se_ufs.c
+@@ -1139,7 +1139,7 @@
+ #define NEO5SE_LOG_TICKS      5
+ 
+ static char neo5se_log_ring[NEO5SE_LOG_SIZE];
+-#define NEO5SE_LOG_KICK_BYTES (32u << 10)
++#define NEO5SE_LOG_KICK_BYTES (8u << 10)
+ 
+ static uint64_t _Atomic neo5se_log_total;
+ static uint64_t _Atomic neo5se_log_next_wake;
+@@ -1248,6 +1248,17 @@
+ 	os_atomic_store(&neo5se_log_flushed, total, relaxed);
+ }
+ 
++/*
++ * Put what is in the ring on the disk now. The sampler calls this after it
++ * prints, so the line describing the last timer interrupt survives the hang
++ * that follows it.
++ */
++void
++neo5se_log_flush_now(void)
++{
++	neo5se_log_store(os_atomic_load(&neo5se_log_total, relaxed));
++}
++
+ /* Called from the UFS write path, which runs throughout the boot. */
+ void
+ neo5se_log_kick(void)
+@@ -1269,15 +1280,17 @@
+ {
+ 	printf("NEO5SE LOG: console ring in the last %u KiB of the partition (block 0x%llx)\n",
+ 	    NEO5SE_LOG_BLOCKS * UFS_BLOCK >> 10, neo5se_log_base);
+-	uint32_t wakes = 0;
+-
+ 	for (;;) {
+ 		uint64_t before, total;
+ 
+ 		total = os_atomic_load(&neo5se_log_total, relaxed);
+ 		before = os_atomic_load(&neo5se_log_flushed, relaxed);
+ 		neo5se_log_store(total);
+-		if ((++wakes & 7) == 0) {
++		/*
++		 * Every wake, not every eighth: the ring wakes per 8 KiB now
++		 * and the tick is rate-limited to once a second anyway.
++		 */
++		{
+ 			extern void neo5se_sample_tick(void);
+ 			neo5se_sample_tick();
+ 		}

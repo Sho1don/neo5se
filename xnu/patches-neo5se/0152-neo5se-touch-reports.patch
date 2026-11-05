@@ -1,0 +1,309 @@
+xnu 0152: the touch wiring is measured; read the id and the reports
+
+0151 found the QUP4 lane order by reading the product id: the four pads carry
+cs gpio19, clk gpio18, mosi gpio17 and miso gpio16, not the order the device
+tree implies. With that order the 0xAA boot-option echo comes back and
+0x00010014 answers the version block (42 45 52 4c 49 4e at the start of the
+data, rom_vid 02 00 04, patch_pid "9916R"), which is exactly what the working
+driver's brl_read_version prints.
+
+Fix the wiring, verify the echo, print the id and the IC info block at 0x10070
+(touch_data_addr 0x00010308, 8-byte head, 8-byte points, both at the offsets
+the packed struct gives), then start a kernel thread that polls IRQ (GPIO21,
+active low), reads a report, hands every finger to MondrianHIDTouch through
+neo5se_hid_touch(), and writes one zero byte back to the report address to
+release the line. Polling at one tick first; GIC 305 and a real interrupt come
+later.
+
+--- a/bsd/dev/neo5se_touch.c
++++ b/bsd/dev/neo5se_touch.c
+@@ -20,8 +20,11 @@
+  * interrupts, and the phone resets on the watchdog.
+  */
+ #include <sys/param.h>
++#include <sys/proc.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+@@ -845,6 +848,131 @@
+ 	neo5se_tlmm_write(neo5se_spi_mosi, NEO5SE_TLMM_IN_OUT, 0);
+ 	neo5se_tlmm_write(neo5se_spi_cs, NEO5SE_TLMM_IN_OUT, 2);
+ 	return 0;
++}
++
++/* IOKit side of the port: MondrianHIDTouch::touch() through its C bridge. */
++extern void neo5se_hid_touch(int finger, int down, int x, int y);
++
++/* The report block, from the working system's IC info dump (ic_info_length
++ * 193): touch_data_addr 0x00010308, head 8 bytes, 8 bytes per point. */
++#define NEO5SE_TOUCH_DATA_ADDR	0x00010308u
++#define NEO5SE_TOUCH_POINT_LEN	8
++#define NEO5SE_TOUCH_FINGERS		10
++
++static uint32_t neo5se_touch_data_addr = NEO5SE_TOUCH_DATA_ADDR;
++
++/*
++ * The register block at 0x10070 is the packed goodix_ic_info. The driver's
++ * struct puts misc.touch_data_addr at 161, touch_data_head_len at 165 and
++ * point_struct_len at 167, and the part's blob is 193 bytes long, so all
++ * three fields are inside it. Read them back instead of trusting the constant:
++ * this firmware's block could carry a different address.
++ */
++static void
++neo5se_touch_ic_info(void)
++{
++	uint8_t info[200];
++	uint32_t addr, i;
++	uint16_t head, point;
++
++	for (i = 0; i < sizeof(info); i++) {
++		info[i] = 0;
++	}
++	(void)neo5se_goodix_read(0x00010070, info, sizeof(info));
++	addr = (uint32_t)info[161] | ((uint32_t)info[162] << 8) |
++	    ((uint32_t)info[163] << 16) | ((uint32_t)info[164] << 24);
++	head = (uint16_t)(info[165] | (info[166] << 8));
++	point = (uint16_t)(info[167] | (info[168] << 8));
++	printf("NEO5SE TOUCH: ic info len %u cfg 0x%x data 0x%x head %u point %u\n",
++	    (unsigned)(info[0] | (info[1] << 8)), info[10], addr, head, point);
++	if (addr != 0 && head >= 8 && head <= 32 && point == NEO5SE_TOUCH_POINT_LEN) {
++		neo5se_touch_data_addr = addr;
++	} else {
++		printf("NEO5SE TOUCH: ic info unusable, keeping 0x%x\n",
++		    neo5se_touch_data_addr);
++	}
++	neo5se_log_flush_now();
++}
++
++/*
++ * The part raises IRQ (GPIO21, active low) when a report is ready and drops it
++ * when the host writes one zero byte back to the report address. Poll the line
++ * instead of wiring GIC 305 for now: once per 10 ms tick is enough to prove the
++ * reports, and leaves the interrupt path for a later patch.
++ */
++static void __attribute__((noreturn))
++neo5se_touch_thread(void *arg, wait_result_t wait)
++{
++	uint8_t head[8], point_buf[2 + NEO5SE_TOUCH_FINGERS * NEO5SE_TOUCH_POINT_LEN];
++	uint8_t was[NEO5SE_TOUCH_FINGERS], now[NEO5SE_TOUCH_FINGERS];
++	int16_t last_x[NEO5SE_TOUCH_FINGERS], last_y[NEO5SE_TOUCH_FINGERS];
++	uint32_t reports = 0, i;
++	int finger, num, point;
++	uint8_t zero = 0;
++
++	(void)arg;
++	(void)wait;
++	for (i = 0; i < NEO5SE_TOUCH_FINGERS; i++) {
++		was[i] = 0;
++		now[i] = 0;
++		last_x[i] = 0;
++		last_y[i] = 0;
++	}
++	for (;;) {
++		(void)tsleep((caddr_t)&neo5se_touch_data_addr, PZERO - 1, "mtouch", 1);
++		if ((neo5se_tlmm_read(neo5se_touch_irq_page, NEO5SE_TLMM_IN_OUT) & 1) != 0) {
++			continue;
++		}
++		(void)neo5se_goodix_read(neo5se_touch_data_addr, head, sizeof(head));
++		num = head[2] & 0x0f;
++		if (num > NEO5SE_TOUCH_FINGERS) {
++			num = NEO5SE_TOUCH_FINGERS;
++		}
++		for (i = 0; i < NEO5SE_TOUCH_FINGERS; i++) {
++			now[i] = 0;
++		}
++		if (num > 0) {
++			for (i = 0; i < sizeof(point_buf); i++) {
++				point_buf[i] = 0;
++			}
++			(void)neo5se_goodix_read(neo5se_touch_data_addr + sizeof(head),
++			    point_buf, (uint32_t)(num * NEO5SE_TOUCH_POINT_LEN + 2));
++			for (point = 0; point < num; point++) {
++				uint8_t *p = &point_buf[point * NEO5SE_TOUCH_POINT_LEN];
++				int id = (p[0] >> 4) & 0x0f;
++				int x = p[2] | (p[3] << 8);
++				int y = p[4] | (p[5] << 8);
++
++				if (id >= NEO5SE_TOUCH_FINGERS) {
++					continue;
++				}
++				now[id] = 1;
++				last_x[id] = (int16_t)x;
++				last_y[id] = (int16_t)y;
++				neo5se_hid_touch(id, 1, x, y);
++				if (reports < 30) {
++					printf("NEO5SE TOUCH: report %u finger %d %d,%d\n",
++					    reports, id, x, y);
++				}
++			}
++		}
++		for (finger = 0; finger < NEO5SE_TOUCH_FINGERS; finger++) {
++			if (was[finger] && !now[finger]) {
++				neo5se_hid_touch(finger, 0, last_x[finger], last_y[finger]);
++				if (reports < 30) {
++					printf("NEO5SE TOUCH: report %u finger %d up\n",
++					    reports, finger);
++				}
++			}
++			was[finger] = now[finger];
++		}
++		/* One zero byte at the report address clears it and releases IRQ. */
++		(void)neo5se_goodix_write(neo5se_touch_data_addr, &zero, 1);
++		if (reports < 30) {
++			neo5se_log_flush_now();
++		}
++		reports++;
++	}
+ }
+ 
+ static void
+@@ -859,89 +987,50 @@
+ 	delay(120000);
+ }
+ 
+-static int
+-neo5se_touch_berlin(const uint8_t *id)
+-{
+-	static const char text[6] = { 'B', 'E', 'R', 'L', 'I', 'N' };
+-	int i;
+-
+-	for (i = 0; i < 6; i++) {
+-		if (id[8 + i] != (uint8_t)text[i]) {
+-			return 0;
+-		}
+-	}
+-	return 1;
+-}
+-
+ static void
+ neo5se_touch_spi_probe(void)
+ {
++	uint8_t id[36], tx[8], rx[8];
++	uint32_t j;
++	int same = 1;
++
+ 	/*
+-	 * The device tree names the four QUP4 pads (gpio16-19) but not which QUP
+-	 * signal each one carries. The 0150 sweep showed the part drives one of
+-	 * them (gpio19 reads high against a pull-down), so the wiring is not the
+-	 * one this driver assumed. One pad is CS and the other three are clk,
+-	 * mosi and miso in some order: try all 24 assignments and keep the one
+-	 * whose read of 0x00010014 returns "BERLIN", which only the real frame
+-	 * can produce.
++	 * Measured with 0151: the QUP4 lanes are cs gpio19, clk gpio18, mosi
++	 * gpio17 and miso gpio16, not the order the tree implies. With that
++	 * order the boot-option echo comes back and 0x10014 answers the version
++	 * block: "BERLIN", rom_vid 02 00 04, patch_pid "9916R".
+ 	 */
+-	static const uint8_t perm[6][3] = {
+-		{ 0, 1, 2 }, { 0, 2, 1 }, { 1, 0, 2 },
+-		{ 1, 2, 0 }, { 2, 0, 1 }, { 2, 1, 0 }
+-	};
+-	uint8_t tx[8], rx[8], id[36], rest[3], n;
+-	int c, p, j;
+-
+-	printf("NEO5SE TOUCH: spi: bit-bang on gpio16-19, goodix framing\n");
++	neo5se_spi_clk = neo5se_spi_page[2];
++	neo5se_spi_mosi = neo5se_spi_page[1];
++	neo5se_spi_miso = neo5se_spi_page[0];
++	neo5se_spi_cs = neo5se_spi_page[3];
++	neo5se_touch_reset_pulse();
++	neo5se_spi_outputs();
++	printf("NEO5SE TOUCH: spi pins cs19 clk18 mosi17 miso16\n");
+ 	neo5se_log_flush_now();
+ 
+-	(void)neo5se_rpmh_rail("ldoc2", 1800, 1);
+-	(void)neo5se_rpmh_rail("ldoc7", 3000, 1);
+-	delay(3000);
+-	neo5se_tlmm_output(neo5se_touch_avdd_page, 0, NEO5SE_TLMM_DRIVE_2MA, 1);
+-
+-	for (c = 0; c < 4; c++) {
+-		n = 0;
+-		for (j = 0; j < 4; j++) {
+-			if (j != c) {
+-				rest[n++] = (uint8_t)j;
+-			}
++	for (j = 0; j < sizeof(tx); j++) {
++		tx[j] = 0xaa;
++		rx[j] = 0;
++	}
++	(void)neo5se_goodix_write(0x10000, tx, sizeof(tx));
++	delay(1000);
++	(void)neo5se_goodix_read(0x10000, rx, sizeof(rx));
++	for (j = 0; j < sizeof(rx); j++) {
++		if (rx[j] != tx[j]) {
++			same = 0;
+ 		}
+-		for (p = 0; p < 6; p++) {
+-			neo5se_spi_clk = neo5se_spi_page[rest[perm[p][0]]];
+-			neo5se_spi_mosi = neo5se_spi_page[rest[perm[p][1]]];
+-			neo5se_spi_miso = neo5se_spi_page[rest[perm[p][2]]];
+-			neo5se_spi_cs = neo5se_spi_page[c];
+-			neo5se_touch_reset_pulse();
+-			neo5se_spi_outputs();
+-			for (j = 0; j < sizeof(tx); j++) {
+-				tx[j] = 0xaa;
+-				rx[j] = 0;
+-			}
+-			(void)neo5se_goodix_write(0x10000, tx, sizeof(tx));
+-			delay(1000);
+-			(void)neo5se_goodix_read(0x10000, rx, sizeof(rx));
+-			for (j = 0; j < sizeof(id); j++) {
+-				id[j] = 0;
+-			}
+-			(void)neo5se_goodix_read(0x00010014, id, sizeof(id));
+-			printf("NEO5SE TOUCH: map cs%d clk%d mosi%d miso%d echo %02x %02x %02x %02x id %02x %02x %02x %02x %02x %02x%s\n",
+-			    16 + c, 16 + rest[perm[p][0]], 16 + rest[perm[p][1]],
+-			    16 + rest[perm[p][2]], rx[0], rx[1], rx[2], rx[3],
+-			    id[8], id[9], id[10], id[11], id[12], id[13],
+-			    neo5se_touch_berlin(id) ? " BERLIN" : "");
+-			neo5se_log_flush_now();
+-			if (neo5se_touch_berlin(id)) {
+-				printf("NEO5SE TOUCH: WIRED cs%d clk%d mosi%d miso%d echo %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-				    16 + c, 16 + rest[perm[p][0]],
+-				    16 + rest[perm[p][1]], 16 + rest[perm[p][2]],
+-				    rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
+-				neo5se_log_flush_now();
+-				return;
+-			}
+-		}
+ 	}
+-	printf("NEO5SE TOUCH: no pad mapping returned BERLIN\n");
++	printf("NEO5SE TOUCH: confirm %s rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    same ? "ok" : "bad", rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
++
++	for (j = 0; j < sizeof(id); j++) {
++		id[j] = 0;
++	}
++	(void)neo5se_goodix_read(0x00010014, id, sizeof(id));
++	printf("NEO5SE TOUCH: id %c%c%c%c%c%c rom_vid %02x %02x %02x patch %c%c%c%c%c sensor %u\n",
++	    id[0], id[1], id[2], id[3], id[4], id[5],
++	    id[6], id[7], id[8], id[10], id[11], id[12], id[13], id[14], id[25]);
+ 	neo5se_log_flush_now();
+ }
+ 
+@@ -950,6 +1039,7 @@
+ void
+ neo5se_touch_probe(void)
+ {
++	thread_t touch_thread;
+ 	printf("NEO5SE TOUCH: TLMM at 0x%lx, reset/irq/avdd pins\n",
+ 	    (unsigned long)NEO5SE_TLMM_BASE);
+ 	neo5se_log_flush_now();
+@@ -971,4 +1061,12 @@
+ 	neo5se_touch_power();
+ 	neo5se_touch_geni_probe();
+ 	neo5se_touch_spi_probe();
++	neo5se_touch_ic_info();
++	if (kernel_thread_start(neo5se_touch_thread, NULL, &touch_thread) == KERN_SUCCESS) {
++		thread_deallocate(touch_thread);
++		printf("NEO5SE TOUCH: report thread started\n");
++	} else {
++		printf("NEO5SE TOUCH: report thread failed to start\n");
++	}
++	neo5se_log_flush_now();
+ }

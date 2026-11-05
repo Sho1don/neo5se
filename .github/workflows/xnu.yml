@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       board:
-        description: Board to build (sweet = Redmi Note 10 Pro, mondrian = POCO F5 Pro)
+        description: Board to build (sweet = Redmi Note 10 Pro, mondrian = POCO F5 Pro, neo5se = Realme GT Neo 5 SE)
         default: sweet
       macos_version:
         description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
@@ -23,6 +23,7 @@ on:
     paths:
       - "xnu/patches/**"
       - "xnu/patches-mondrian/**"
+      - "xnu/patches-neo5se/**"
       - ".github/workflows/xnu.yml"
 
 concurrency:
@@ -53,6 +54,7 @@ jobs:
           case "$BOARD" in
             sweet)    SERIES=xnu/patches;          MACHINE=SWEET ;;
             mondrian) SERIES=xnu/patches-mondrian; MACHINE=MONDRIAN ;;
+            neo5se)   SERIES=xnu/patches-neo5se;   MACHINE=NEO5SE ;;
             *) echo "error: unknown board '$BOARD'" >&2; exit 1 ;;
           esac
           if [ -n "${{ inputs.machine_config }}" ]; then

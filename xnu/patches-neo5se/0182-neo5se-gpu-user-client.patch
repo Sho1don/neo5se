@@ -1,0 +1,1040 @@
+xnu 0182: Neo5seGPU, the IOKit face Mesa's msm backend talks to
+
+Mesa's freedreno does not speak IOAccelerator: it opens a service and sends
+Linux msm DRM requests as IOConnectCallStructMethod calls whose selector is
+the low byte of the ioctl code, with Linux's include/uapi/drm/msm_drm.h
+structures unchanged, both ways. This adds that service and its user client:
+GET_PARAM (chip 0x07030002, gmem, va range), GEM_NEW, GEM_INFO (GET/SET_IOVA,
+GET_FLAGS), GEM_CLOSE, CPU_PREP/FINI, GEM_SUBMIT (one indirect buffer per
+command, copied in from the caller), WAIT_FENCE, madvise and the submit
+queues. A buffer's memory is the client memory of the type that is its
+handle, so the Darwin back end maps it with IOConnectMapMemory64.
+
+Buffers are IOBufferMemoryDescriptors mapped page by page into the CP's
+stage-1 context with user-accessible permissions (packets executed from an
+indirect buffer run unprivileged), and one submission is an
+CP_INDIRECT_BUFFER_PFE plus a CP_EVENT_WRITE fence into the ring that
+bsd/dev/neo5se_gpu.c owns; fences are the dwords the CP writes into the
+memptr page and are waited on through its write-combined alias. Visible as
+`Neo5seGPU: service published` and reachable with IOServiceMatching.
+
+The client's mapping of a buffer is cacheable, not inhibited: an uncached
+mapping turns the 18 MB readback of one 1440x3200 surface into 5.7 s
+(measured), because every byte is a separate bus read. Coherency is explicit
+instead, the way msm does it: every buffer of a submission is written back
+before the CP fetches it (flush_dcache64 by physical address, the
+dma_buf_end_cpu_access half) and dropped again on CPU_PREP, before the CPU
+reads what the CP wrote. The first eight CPU_PREP calls log their wait and
+sync cost in microseconds.
+
+Registers the file in iokit/conf/files.arm64. Relocations
+(MSM_SUBMIT_CMD_BUF with nr_relocs != 0) are refused for now: Mesa's msm
+backend uses softpin, which is what GEM_INFO implements.
+diff --git a/iokit/Kernel/arm/Neo5seGPU.cpp b/iokit/Kernel/arm/Neo5seGPU.cpp
+new file mode 100644
+index 0000000..d492b41
+--- /dev/null
++++ b/iokit/Kernel/arm/Neo5seGPU.cpp
+@@ -0,0 +1,952 @@
++/*
++ * Neo5seGPU: the GPU's IOKit driver for neo5se (Adreno 730, SM8475).
++ * See Neo5seGPU.h for the shape of the interface.
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOUserClient.h>
++#include <kern/clock.h>
++#include <sys/systm.h>
++
++#include "Neo5seGPU.h"
++#include "MondrianSurface.h"
++
++/* The IOKit build has no top-level include for bsd/; the relative path is
++ * stable in the tree and in the patch. */
++extern "C" {
++#include "../../../bsd/dev/neo5se_gpu_api.h"
++}
++
++/*
++ * Linux's include/uapi/drm/msm_drm.h (v6.6): the request numbers are the low
++ * byte of DRM_IOCTL_MSM_* (DRM_COMMAND_BASE is 0x40) and the structures are
++ * Linux's, so the same user space works on both systems.
++ */
++enum {
++	kDrmGemClose         = 0x09,
++	kMsmGetParam         = 0x40,
++	kMsmSetParam         = 0x41,
++	kMsmGemNew           = 0x42,
++	kMsmGemInfo          = 0x43,
++	kMsmGemCpuPrep       = 0x44,
++	kMsmGemCpuFini       = 0x45,
++	kMsmGemSubmit        = 0x46,
++	kMsmWaitFence        = 0x47,
++	kMsmGemMadvise       = 0x48,
++	kMsmSubmitQueueNew   = 0x4a,
++	kMsmSubmitQueueClose = 0x4b,
++	kMsmSubmitQueueQuery = 0x4c,
++	kMondrianSurface     = 0x7e,
++};
++
++#define kMondrianDescribe	0xffffffffu
++
++struct msm_timespec {
++	int64_t tv_sec, tv_nsec;
++};
++struct msm_param {
++	uint32_t pipe, param;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_new {
++	uint64_t size;
++	uint32_t flags, handle;
++};
++struct msm_gem_info {
++	uint32_t handle, info;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_cpu_prep {
++	uint32_t handle, op;
++	struct msm_timespec timeout;
++};
++struct msm_gem_cpu_fini {
++	uint32_t handle;
++};
++struct msm_gem_submit_cmd {
++	uint32_t type, submit_idx, submit_offset, size, pad, nr_relocs;
++	uint64_t relocs;
++};
++struct msm_gem_submit_bo {
++	uint32_t flags, handle;
++	uint64_t presumed;
++};
++struct msm_gem_submit {
++	uint32_t flags, fence, nr_bos, nr_cmds;
++	uint64_t bos, cmds;
++	int32_t fence_fd;
++	uint32_t queueid;
++	uint64_t in_syncobjs, out_syncobjs;
++	uint32_t nr_in_syncobjs, nr_out_syncobjs, syncobj_stride, pad;
++};
++struct msm_wait_fence {
++	uint32_t fence, flags;
++	struct msm_timespec timeout;
++	uint32_t queueid;
++};
++struct msm_gem_madvise {
++	uint32_t handle, madv, retained;
++};
++struct msm_submitqueue {
++	uint32_t flags, prio, id;
++};
++struct msm_submitqueue_query {
++	uint64_t data;
++	uint32_t id, param, len, pad;
++};
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++
++/*
++ * The port's own request (0x7e): an IOSurface's memory as a GPU buffer. The
++ * numbering and the shape are topaz's kRedwoodSurface, which is what the
++ * CoreAnimation side (tools/gpu/gl_osmesa.c) documents and expects.
++ */
++struct neo5se_surface {
++	uint32_t surface;		/* in: IOSurfaceGetID() */
++	uint32_t handle;		/* 0xffffffff: describe only, else the GEM handle */
++	uint64_t size;			/* back: the buffer's size */
++	uint32_t offset, rowBytes;	/* where the pixels start, how long a row is */
++	uint32_t width, height, pixelFormat, planes;	/* and what they are */
++};
++
++#define MSM_INFO_GET_IOVA	0x01
++#define MSM_INFO_SET_IOVA	0x04
++#define MSM_INFO_GET_FLAGS	0x05
++#define MSM_SUBMIT_CMD_BUF	1
++#define MSM_PREP_NOSYNC		0x04
++
++#define kMondrianBufferMax	(256u << 20)
++#define kMondrianBuffers	1024
++#define kMondrianSubmits	64
++#define kMondrianPatienceMs	5000
++/* Packets executed from an indirect buffer run unprivileged, so every buffer
++ * a submission touches must be user accessible (the ring and the memptr page
++ * are mapped the same way in the C half). Write lets the CPU fill it. */
++#define kMondrianBufferPerms	3u
++
++struct neo5se_buffer {
++	uint32_t handle;
++	uint64_t size;
++	uint64_t iova;
++	IOMemoryDescriptor *memory;
++};
++
++class Neo5seGPU;
++
++class Neo5seGPUUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(Neo5seGPUUserClient);
++
++public:
++	virtual bool initWithTask(task_t owningTask, void *securityToken,
++	    UInt32 type, OSDictionary *properties) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
++	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector,
++	    IOExternalMethodArguments *arguments,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++
++private:
++	IOReturn gemNew(struct msm_gem_new *request);
++	IOReturn gemInfo(struct msm_gem_info *request);
++	IOReturn surfaceBuffer(struct neo5se_surface *request);
++	IOReturn submit(struct msm_gem_submit *request);
++	neo5se_buffer *bufferForType(uint32_t type);
++	neo5se_buffer *bufferNew(uint64_t size);
++	neo5se_buffer *bufferAdopt(IOMemoryDescriptor *memory, uint64_t size);
++	void bufferFree(neo5se_buffer *buffer);
++	void bufferSync(neo5se_buffer *buffer);
++	void freeAll(void);
++
++	IOLock *fLock;
++	neo5se_buffer *fBuffers[kMondrianBuffers];
++	uint32_t fBufferCount;
++	uint32_t fNextHandle;
++	uint32_t fNextQueue;
++	uint32_t fLastFence;
++	uint32_t fLogged;
++	uint32_t fDumped;
++	uint32_t fNested;
++	uint32_t fStateGroup;
++	uint32_t fPrepLogged;
++};
++
++class Neo5seGPU : public IOService
++{
++	OSDeclareDefaultStructors(Neo5seGPU);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityToken,
++	    UInt32 type, OSDictionary *properties,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(Neo5seGPU, IOService);
++
++bool
++Neo5seGPU::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty("IOUserClientClass", "Neo5seGPUUserClient");
++	setName("Neo5seGPU");
++	registerService();
++	IOLog("Neo5seGPU: service published (chip 0x07030002)\n");
++	return true;
++}
++
++IOReturn
++Neo5seGPU::newUserClient(task_t owningTask, void *securityToken, UInt32 type,
++    OSDictionary *properties, IOUserClient **handler)
++{
++	Neo5seGPUUserClient *client;
++
++	(void)type;
++	(void)properties;
++	if (handler == NULL) {
++		return kIOReturnBadArgument;
++	}
++	client = OSTypeAlloc(Neo5seGPUUserClient);
++	if (client == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (!client->initWithTask(owningTask, securityToken, type, properties) ||
++	    !client->attach(this) || !client->start(this)) {
++		client->detach(this);
++		client->release();
++		return kIOReturnError;
++	}
++	*handler = client;
++	return kIOReturnSuccess;
++}
++
++void
++Neo5seGPUStart(void)
++{
++	IOService *provider = (IOService *)IOService::getPlatform();
++	Neo5seGPU *gpu;
++
++	if (!neo5se_gpu_uc_ready()) {
++		IOLog("Neo5seGPU: the CP is not running, no service\n");
++		return;
++	}
++	gpu = OSTypeAlloc(Neo5seGPU);
++	if (gpu == NULL || provider == NULL || !gpu->init() ||
++	    !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("Neo5seGPU: cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("Neo5seGPU: the service did not start\n");
++	}
++	gpu->release();
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++#define super IOUserClient
++OSDefineMetaClassAndStructors(Neo5seGPUUserClient, IOUserClient);
++
++bool
++Neo5seGPUUserClient::initWithTask(task_t owningTask, void *securityToken,
++    UInt32 type, OSDictionary *properties)
++{
++	if (!super::initWithTask(owningTask, securityToken, type, properties)) {
++		return false;
++	}
++	fLock = IOLockAlloc();
++	fBufferCount = 0;
++	fNextHandle = 1;
++	fNextQueue = 0;
++	fLastFence = 0;
++	fLogged = 0;
++	fDumped = 0;
++	fNested = 0;
++	fStateGroup = 0;
++	fPrepLogged = 0;
++	if (fLock == NULL) {
++		return false;
++	}
++	bzero(fBuffers, sizeof(fBuffers));
++	return true;
++}
++
++void
++Neo5seGPUUserClient::freeAll(void)
++{
++	uint32_t i;
++
++	for (i = 0; i < fBufferCount; i++) {
++		bufferFree(fBuffers[i]);
++	}
++	fBufferCount = 0;
++}
++
++IOReturn
++Neo5seGPUUserClient::clientClose(void)
++{
++	if (fLock != NULL) {
++		IOLockLock(fLock);
++		freeAll();
++		IOLockUnlock(fLock);
++	}
++	return kIOReturnSuccess;
++}
++
++neo5se_buffer *
++Neo5seGPUUserClient::bufferForType(uint32_t type)
++{
++	uint32_t i;
++
++	for (i = 0; i < fBufferCount; i++) {
++		if (fBuffers[i] != NULL && fBuffers[i]->handle == type) {
++			return fBuffers[i];
++		}
++	}
++	return NULL;
++}
++
++/*
++ * Hand a buffer's memory back to whoever reads it next. The GPU is not
++ * coherent with the CPU's caches: the CP writes DRAM behind them, so the CPU
++ * has to drop its lines before it reads what the CP wrote, and write its own
++ * lines back before the CP fetches them. flush_dcache64 takes a physical
++ * address and the physmap alias covers DRAM, which is the operation
++ * msm_gem_submit performs for dma_buf_end_cpu_access.
++ */
++void
++Neo5seGPUUserClient::bufferSync(neo5se_buffer *buffer)
++{
++	uint64_t off;
++
++	for (off = 0; off < buffer->size; off += 0x1000) {
++		IOByteCount length = 0;
++		addr64_t pa = buffer->memory->getPhysicalSegment(off, &length);
++
++		if (pa != 0 && length != 0) {
++			(void)neo5se_gpu_uc_flush(pa, length);
++		}
++	}
++}
++
++neo5se_buffer *
++Neo5seGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
++{
++	neo5se_buffer *buffer;
++	uint64_t iova, off;
++	uint32_t i;
++
++	size = (size + 0xfffu) & ~0xfffull;
++	if (memory == NULL || size == 0 || size > kMondrianBufferMax ||
++	    fBufferCount >= kMondrianBuffers) {
++		return NULL;
++	}
++	iova = neo5se_gpu_uc_iova_alloc(size);
++	if (iova == 0) {
++		return NULL;
++	}
++	for (off = 0; off < size; off += 0x1000) {
++		IOByteCount length = 0;
++		addr64_t pa = memory->getPhysicalSegment(off, &length);
++
++		if (pa == 0 || length == 0) {
++			for (i = 0; i < off; i += 0x1000) {
++				(void)neo5se_gpu_uc_unmap_page(iova + i);
++			}
++			return NULL;
++		}
++		if (neo5se_gpu_uc_map_page(iova + off, pa,
++		    kMondrianBufferPerms) != 0) {
++			for (i = 0; i <= off; i += 0x1000) {
++				(void)neo5se_gpu_uc_unmap_page(iova + i);
++			}
++			return NULL;
++		}
++	}
++	(void)neo5se_gpu_uc_tables_sync();
++	buffer = (neo5se_buffer *)IOMalloc(sizeof(neo5se_buffer));
++	if (buffer == NULL) {
++		return NULL;
++	}
++	memory->retain();
++	buffer->handle = fNextHandle++;
++	buffer->size = size;
++	buffer->iova = iova;
++	buffer->memory = memory;
++	fBuffers[fBufferCount++] = buffer;
++	return buffer;
++}
++
++neo5se_buffer *
++Neo5seGPUUserClient::bufferNew(uint64_t size)
++{
++	IOBufferMemoryDescriptor *memory;
++	neo5se_buffer *buffer;
++
++	if (size == 0 || size > kMondrianBufferMax || fBufferCount >=
++	    kMondrianBuffers) {
++		return NULL;
++	}
++	/*
++	 * Page-wise, not physically contiguous: the stage-1 mapping walks the
++	 * descriptor page by page, and asking for a contiguous megabyte makes
++	 * the VM hunt for one (measured: vm_page_find_contiguous with
++	 * num=256, a zone GC and a boot that never finished the allocation).
++	 */
++	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut, (size + 0xfffu) & ~0xfffull,
++	    0x00000000fffff000ull);
++	if (memory == NULL) {
++		return NULL;
++	}
++	buffer = bufferAdopt(memory, size);
++	memory->release();
++	return buffer;
++}
++
++void
++Neo5seGPUUserClient::bufferFree(neo5se_buffer *buffer)
++{
++	uint64_t off;
++	uint32_t i;
++
++	if (buffer == NULL) {
++		return;
++	}
++	for (off = 0; off < buffer->size; off += 0x1000) {
++		(void)neo5se_gpu_uc_unmap_page(buffer->iova + off);
++	}
++	(void)neo5se_gpu_uc_tables_sync();
++	if (buffer->memory != NULL) {
++		buffer->memory->release();
++	}
++	for (i = 0; i < fBufferCount; i++) {
++		if (fBuffers[i] == buffer) {
++			fBuffers[i] = fBuffers[--fBufferCount];
++			fBuffers[fBufferCount] = NULL;
++			break;
++		}
++	}
++	IOFree(buffer, sizeof(neo5se_buffer));
++}
++
++IOReturn
++Neo5seGPUUserClient::gemNew(struct msm_gem_new *request)
++{
++	neo5se_buffer *buffer;
++
++	IOLockLock(fLock);
++	buffer = bufferNew(request->size);
++	if (buffer == NULL) {
++		IOLockUnlock(fLock);
++		IOLog("Neo5seGPU: gem_new 0x%llx refused\n",
++		    (unsigned long long)request->size);
++		return kIOReturnNoMemory;
++	}
++	request->handle = buffer->handle;
++	IOLockUnlock(fLock);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++Neo5seGPUUserClient::gemInfo(struct msm_gem_info *request)
++{
++	neo5se_buffer *buffer;
++	IOReturn result = kIOReturnSuccess;
++
++	IOLockLock(fLock);
++	buffer = bufferForType(request->handle);
++	if (buffer == NULL) {
++		IOLockUnlock(fLock);
++		return kIOReturnBadArgument;
++	}
++	switch (request->info) {
++	case MSM_INFO_GET_IOVA:
++		request->value = buffer->iova;
++		break;
++	case MSM_INFO_SET_IOVA:
++		if (request->value != 0 && request->value != buffer->iova) {
++			result = kIOReturnUnsupported;
++		}
++		break;
++	case MSM_INFO_GET_FLAGS:
++		request->value = 0;
++		break;
++	default:
++		result = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(fLock);
++	return result;
++}
++
++IOReturn
++Neo5seGPUUserClient::surfaceBuffer(struct neo5se_surface *request)
++{
++	MondrianSurface *surface;
++	neo5se_buffer *buffer;
++	uint32_t planes;
++
++	surface = neo5se_surface_copy(request->surface);
++	if (surface == NULL) {
++		return kIOReturnNotFound;
++	}
++	planes = surface->planeCount;
++	if (planes == 0) {
++		planes = 1;
++	}
++	request->size = surface->allocSize;
++	request->offset = surface->offset;
++	request->rowBytes = surface->bytesPerRow;
++	request->width = surface->width;
++	request->height = surface->height;
++	request->pixelFormat = surface->pixelFormat;
++	request->planes = planes;
++	if (request->handle == kMondrianDescribe) {
++		surface->release();
++		return kIOReturnSuccess;
++	}
++	IOLockLock(fLock);
++	buffer = bufferAdopt(surface->memory, surface->allocSize);
++	IOLockUnlock(fLock);
++	surface->release();
++	if (buffer == NULL) {
++		return kIOReturnNoMemory;
++	}
++	request->handle = buffer->handle;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++Neo5seGPUUserClient::submit(struct msm_gem_submit *request)
++{
++	struct msm_gem_submit_cmd cmds[kMondrianSubmits];
++	struct msm_gem_submit_bo bos[kMondrianSubmits];
++	uint32_t fence = 0, i;
++	IOReturn result = kIOReturnSuccess;
++
++	if (request->nr_bos > kMondrianSubmits || request->nr_cmds == 0 ||
++	    request->nr_cmds > kMondrianSubmits || request->bos == 0 ||
++	    request->cmds == 0) {
++		return kIOReturnBadArgument;
++	}
++	if (copyin((user_addr_t)request->bos, bos,
++	    request->nr_bos * sizeof(bos[0])) != 0 ||
++	    copyin((user_addr_t)request->cmds, cmds,
++	    request->nr_cmds * sizeof(cmds[0])) != 0) {
++		return kIOReturnBadArgument;
++	}
++	if (fLogged < 4) {
++		fLogged++;
++		IOLog("Neo5seGPU: submit flags 0x%x bos %u cmds %u type %u size %u "
++		    "relocs %u idx %u\n", request->flags, request->nr_bos,
++		    request->nr_cmds, cmds[0].type, cmds[0].size,
++		    cmds[0].nr_relocs, cmds[0].submit_idx);
++	}
++	/*
++	 * Rewrite knobs (gpunop/gpumode/gpudstate/gpudsaddr). Scan only the
++	 * range each command actually submits: the stream lives inside a BO
++	 * that is usually far larger, so a whole-BO walk both misses the
++	 * packet (it is not at offset zero) and reads enough dwords to wedge
++	 * the boot.
++	 */
++	{
++		uint32_t opcode = neo5se_gpu_uc_nop_opcode();
++		uint32_t mode = neo5se_gpu_uc_set_mode();
++		uint32_t ds = neo5se_gpu_uc_draw_state();
++		uint32_t dsaddr = neo5se_gpu_uc_ds_addr();
++		uint32_t i;
++
++		if (neo5se_gpu_uc_noblit()) {
++			opcode = 0x2c;		/* CP_BLIT */
++		}
++		for (i = 0; (opcode != 0 || mode != 0xffffffffu || ds != 0 ||
++		    dsaddr != 0) && i < request->nr_cmds; i++) {
++			neo5se_buffer *bo;
++			uint64_t at = 0;
++
++			if (cmds[i].type != MSM_SUBMIT_CMD_BUF ||
++			    cmds[i].size == 0 || cmds[i].size > 0x100000 ||
++			    cmds[i].submit_idx >= request->nr_bos) {
++				continue;
++			}
++			bo = bufferForType(bos[cmds[i].submit_idx].handle);
++			if (bo == NULL) {
++				continue;
++			}
++			while (at + 4 <= cmds[i].size) {
++				uint64_t off = cmds[i].submit_offset + at;
++				uint32_t word;
++
++				if (off + 4 > bo->size) {
++					break;
++				}
++				if (bo->memory->readBytes(off, &word, 4) != 4) {
++					break;
++				}
++				if ((word >> 28) == 7 &&
++				    ((word >> 16) & 0x7f) == opcode) {
++					uint32_t nop = 0x70000000u |
++					    (word & 0x3fff);
++
++					bo->memory->writeBytes(off, &nop, 4);
++				}
++				/* gpudstate=N: keep the first N groups. */
++				if (ds != 0 && (word >> 28) == 7 &&
++				    ((word >> 16) & 0x7f) == 0x43 &&
++				    (word & 0x3fff) > 3 * ds) {
++					uint32_t keep = 3 * ds;
++					uint32_t count = word & 0x3fff;
++					uint32_t header = 0x70000000u |
++					    keep | (1u << 15) | (0x10u << 16);
++					uint32_t pad = count - keep;
++					uint32_t pad_header = 0x70000000u |
++					    (pad - 1) | (1u << 15) |
++					    (0x10u << 16);
++
++					bo->memory->writeBytes(off, &header, 4);
++					bo->memory->writeBytes(off + 4 + keep,
++					    &pad_header, 4);
++				}
++				/* gpudsaddr=1: point the first group at the
++				 * memptr page, which the CP already writes,
++				 * with a two-register count. */
++				if (dsaddr != 0 && (word >> 28) == 7 &&
++				    ((word >> 16) & 0x7f) == 0x43 &&
++				    (word & 0x3fff) >= 3) {
++					uint32_t first = (2u << 0) |
++					    (word & 0xff000000u) |
++					    (word & 0x00f00000u) | (1u << 15);
++					uint32_t addr = (uint32_t)
++					    (neo5se_gpu_uc_memptr_iova() +
++					    0x800u);
++					uint32_t zero = 0;
++
++					bo->memory->writeBytes(off + 4, &first, 4);
++					bo->memory->writeBytes(off + 8, &addr, 4);
++					bo->memory->writeBytes(off + 12, &zero, 4);
++				}
++				/* gpumode=N: rewrite a CP_SET_MODE payload. */
++				if (mode != 0xffffffffu && (word >> 28) == 7 &&
++				    ((word >> 16) & 0x7f) == 0x63 &&
++				    (word & 0x3fff) >= 1) {
++					bo->memory->writeBytes(off + 4, &mode, 4);
++				}
++				at += 4;
++			}
++		}
++	}
++	/*
++	 * Write back every buffer the submission touches, not just the command
++	 * stream. Mesa fills VBOs, shader consts and the draw-state fragments
++	 * through the CPU; the CP fetches them with its own (unprivileged)
++	 * access, and a state fragment it reads as zeros is an unknown-opcode
++	 * halt. Flushing only the command buffers left that to cache
++	 * eviction, which is exactly the boot-to-boot nondeterminism.
++	 */
++	for (i = 0; i < request->nr_bos; i++) {
++		neo5se_buffer *bo = bufferForType(bos[i].handle);
++
++		if (bo != NULL) {
++			bufferSync(bo);
++		}
++	}
++	IOLockLock(fLock);
++	for (i = 0; i < request->nr_cmds; i++) {
++		neo5se_buffer *buffer;
++
++		if (cmds[i].type != MSM_SUBMIT_CMD_BUF || cmds[i].nr_relocs != 0 ||
++		    cmds[i].size == 0 || cmds[i].submit_idx >= request->nr_bos) {
++			IOLog("Neo5seGPU: command %u refused (type %u relocs %u "
++			    "size %u idx %u of %u)\n", i, cmds[i].type,
++			    cmds[i].nr_relocs, cmds[i].size,
++			    cmds[i].submit_idx, request->nr_bos);
++			result = kIOReturnUnsupported;
++			break;
++		}
++		buffer = bufferForType(bos[cmds[i].submit_idx].handle);
++		if (buffer == NULL) {
++			result = kIOReturnBadArgument;
++			break;
++		}
++		/*
++		 * The stream Mesa submits chains the draw through its own
++		 * CP_INDIRECT_BUFFER; that target is where a real driver's
++		 * packets live, so dump it too, once.
++		 */
++		if (fNested < 4 && cmds[i].size > 64) {
++			uint32_t words[8];
++			uint32_t at = 0;
++
++			fNested++;
++			while (at + 4 <= cmds[i].size) {
++				if (buffer->memory->readBytes(
++				    cmds[i].submit_offset + at, words, 16) != 16) {
++					break;
++				}
++				if ((words[0] >> 28) == 7 &&
++				    ((words[0] >> 16) & 0x7f) == 0x3f &&
++				    (words[0] & 0x3fff) == 3) {
++					uint64_t addr = words[1] |
++					    ((uint64_t)words[2] << 32);
++					uint32_t size = words[3];
++					uint32_t b;
++
++					IOLog("Neo5seGPU: nested ib 0x%llx %u dwords\n",
++					    (unsigned long long)addr, size);
++					for (b = 0; b < request->nr_bos; b++) {
++						neo5se_buffer *target =
++						    bufferForType(bos[b].handle);
++						uint32_t q;
++
++						if (target == NULL ||
++						    addr < target->iova ||
++						    addr + 4ull * size >
++						    target->iova + target->size) {
++							continue;
++						}
++						for (q = 0; q < size; q += 8) {
++							bzero(words, sizeof(words));
++							if (target->memory->
++							    readBytes(addr - target->iova +
++							    q * 4, words, sizeof(words)) !=
++							    sizeof(words)) {
++								break;
++							}
++							IOLog("Neo5seGPU: pm4 %u %08x %08x %08x %08x %08x %08x %08x %08x\n",
++							    q * 4, words[0], words[1],
++							    words[2], words[3], words[4],
++							    words[5], words[6], words[7]);
++						}
++						break;
++					}
++					at += 16;
++					continue;
++				}
++				if ((words[0] >> 28) == 7) {
++					at += 4 * (1 + (words[0] & 0x3fff));
++				} else {
++					at += 4;
++				}
++			}
++		}
++		if (cmds[i].size > 64 && fDumped < 3) {
++			/* The whole first driver-sized stream, eight words a
++			 * line, so tools/pm4-decode.py can name every packet. */
++			uint32_t words[8];
++			uint32_t at = 0;
++
++			fDumped++;
++			IOLog("Neo5seGPU: pm4 stream %u size %u\n", fDumped,
++			    cmds[i].size);
++			while (at < cmds[i].size) {
++				uint32_t chunk = cmds[i].size - at;
++
++				if (chunk > sizeof(words)) {
++					chunk = sizeof(words);
++				}
++				bzero(words, sizeof(words));
++				if (buffer->memory->readBytes(
++				    cmds[i].submit_offset + at, words, chunk) !=
++				    chunk) {
++					break;
++				}
++				IOLog("Neo5seGPU: pm4 %u %08x %08x %08x %08x "
++				    "%08x %08x %08x %08x\n", at, words[0],
++				    words[1], words[2], words[3], words[4],
++				    words[5], words[6], words[7]);
++				at += chunk;
++			}
++		}
++		{
++			uint32_t dwords = cmds[i].size / 4;
++			uint32_t limit = neo5se_gpu_uc_pm4_limit();
++
++			if (limit != 0 && dwords > limit) {
++				dwords = limit;		/* gpupm4=N: bisect */
++			}
++			if (neo5se_gpu_uc_submit(buffer->iova +
++			    cmds[i].submit_offset, dwords, &fence) != 0) {
++				result = kIOReturnError;
++				break;
++			}
++		}
++	}
++	IOLockUnlock(fLock);
++	if (result == kIOReturnSuccess) {
++		request->fence = fence;
++		fLastFence = fence;
++	}
++	return result;
++}
++
++IOReturn
++Neo5seGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
++    IOMemoryDescriptor **memory)
++{
++	neo5se_buffer *buffer;
++	IOReturn result = kIOReturnBadArgument;
++
++	if (options == NULL || memory == NULL) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	buffer = bufferForType(type);
++	if (buffer != NULL) {
++		buffer->memory->retain();
++		*memory = buffer->memory;
++		/* The GPU writes DRAM behind the CPU's caches, but an uncached
++		 * user mapping is not the answer: reading one 1440x3200
++		 * surface back (18 MB) then costs seconds. The mapping stays
++		 * cacheable and the driver keeps it coherent explicitly,
++		 * bufferSync() on both hand-offs. */
++		*options = kIOMapDefaultCache;
++		result = kIOReturnSuccess;
++	}
++	IOLockUnlock(fLock);
++	return result;
++}
++
++IOReturn
++Neo5seGPUUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch,
++    OSObject *target, void *reference)
++{
++	union {
++		struct msm_param param;
++		struct msm_gem_new gemNew;
++		struct msm_gem_info gemInfo;
++		struct msm_gem_cpu_prep cpuPrep;
++		struct msm_gem_submit submit;
++		struct msm_wait_fence waitFence;
++		struct msm_gem_madvise madvise;
++		struct msm_submitqueue queue;
++		struct msm_submitqueue_query query;
++		struct drm_gem_close close;
++		struct neo5se_surface surface;
++	} request;
++	size_t size = arguments->structureInputSize;
++	IOReturn result = kIOReturnSuccess;
++
++	(void)dispatch;
++	(void)target;
++	(void)reference;
++	if (arguments->structureInput == NULL || size > sizeof(request)) {
++		return kIOReturnBadArgument;
++	}
++	bzero(&request, sizeof(request));
++	memcpy(&request, arguments->structureInput, size);
++	if (!neo5se_gpu_uc_ready()) {
++		return kIOReturnNotReady;
++	}
++	switch (selector) {
++	case kMsmGetParam:
++		result = neo5se_gpu_uc_param(request.param.param,
++		    &request.param.value) == 0 ? kIOReturnSuccess :
++		    kIOReturnBadArgument;
++		break;
++	case kMsmSetParam:
++	case kMsmGemCpuFini:
++	case kMsmSubmitQueueClose:
++		break;
++	case kMsmGemNew:
++		result = gemNew(&request.gemNew);
++		break;
++	case kMsmGemInfo:
++		result = gemInfo(&request.gemInfo);
++		break;
++	case kMsmGemCpuPrep: {
++		uint64_t start = mach_absolute_time();
++		uint64_t afterWait;
++		neo5se_buffer *buffer;
++
++		/* The CPU is about to touch a buffer: it is done when every
++		 * submission this client made is done, because there is one
++		 * ring and submissions run in order. Then drop the lines it
++		 * may still hold: the CP wrote DRAM behind them. */
++		IOLockLock(fLock);
++		if (!(request.cpuPrep.op & MSM_PREP_NOSYNC) && fLastFence != 0) {
++			if (neo5se_gpu_uc_wait(fLastFence,
++			    kMondrianPatienceMs) != 0) {
++				result = kIOReturnBusy;
++			}
++		}
++		afterWait = mach_absolute_time();
++		buffer = bufferForType(request.cpuPrep.handle);
++		if (buffer != NULL) {
++			bufferSync(buffer);
++		}
++		IOLockUnlock(fLock);
++		if (fPrepLogged < 8) {
++			uint64_t waited = 0, synced = 0;
++
++			fPrepLogged++;
++			absolutetime_to_nanoseconds(afterWait - start,
++			    &waited);
++			absolutetime_to_nanoseconds(
++			    mach_absolute_time() - afterWait, &synced);
++			IOLog("Neo5seGPU: prep %u wait %llu us sync %llu us\n",
++			    request.cpuPrep.handle,
++			    waited / 1000, synced / 1000);
++		}
++		break;
++	}
++	case kMsmGemSubmit:
++		result = submit(&request.submit);
++		break;
++	case kMsmWaitFence:
++		result = neo5se_gpu_uc_wait(request.waitFence.fence,
++		    kMondrianPatienceMs) == 0 ? kIOReturnSuccess :
++		    kIOReturnTimeout;
++		break;
++	case kMsmGemMadvise:
++		request.madvise.retained = 1;
++		break;
++	case kMsmSubmitQueueNew:
++		request.queue.id = ++fNextQueue;
++		break;
++	case kMsmSubmitQueueQuery:
++		break;
++	case kMondrianSurface:
++		result = surfaceBuffer(&request.surface);
++		break;
++	case kDrmGemClose:
++		IOLockLock(fLock);
++		{
++			neo5se_buffer *buffer =
++			    bufferForType(request.close.handle);
++
++			if (buffer == NULL) {
++				result = kIOReturnBadArgument;
++			} else {
++				bufferFree(buffer);
++			}
++		}
++		IOLockUnlock(fLock);
++		break;
++	default:
++		IOLog("Neo5seGPU: request %#x (%zu bytes) is not known\n",
++		    selector, size);
++		result = kIOReturnUnsupported;
++		break;
++	}
++	if (result == kIOReturnSuccess && arguments->structureOutput != NULL) {
++		if (arguments->structureOutputSize > size) {
++			arguments->structureOutputSize = (uint32_t)size;
++		}
++		memcpy(arguments->structureOutput, &request,
++		    arguments->structureOutputSize);
++	}
++	return result;
++}
+diff --git a/iokit/Kernel/arm/Neo5seGPU.h b/iokit/Kernel/arm/Neo5seGPU.h
+new file mode 100644
+index 0000000..a90231d
+--- /dev/null
++++ b/iokit/Kernel/arm/Neo5seGPU.h
+@@ -0,0 +1,32 @@
++/*
++ * Neo5seGPU: the GPU's IOKit face for neo5se (Adreno 730, SM8475).
++ *
++ * Mesa's freedreno speaks Linux msm DRM, not IOAccelerator: it opens this
++ * service and every request is one IOConnectCallStructMethod whose selector
++ * is the low byte of the ioctl code (DRM_COMMAND_BASE + 0x02 and friends),
++ * with Linux's structures from include/uapi/drm/msm_drm.h unchanged, both
++ * ways. A buffer's memory is the client memory of the type that is its
++ * handle (freedreno's Darwin back end maps it with IOConnectMapMemory64).
++ *
++ * The bring-up (power, GMU, ZAP, CP, SMMU, ring, fences) stays in
++ * bsd/dev/neo5se_gpu.c behind bsd/dev/neo5se_gpu_api.h; this file owns
++ * what is per connection: buffers, their GPU addresses, the user mapping and
++ * the request decoding.
++ */
++#ifndef _IOKIT_ARM_NEO5SEGPU_H
++#define _IOKIT_ARM_NEO5SEGPU_H
++
++#include <IOKit/IOService.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Publishes the service once the CP is running (neo5se_gpu.c). */
++void Neo5seGPUStart(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _IOKIT_ARM_NEO5SEGPU_H */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index cada9db..1a812fd 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -10,6 +10,7 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+ iokit/Kernel/arm/Neo5sePlatformExpert.cpp                         optional iokitcpp
+ iokit/Kernel/arm/MondrianSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/MondrianFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/Neo5seGPU.cpp                                   optional iokitcpp
+ 
+ iokit/Kernel/arm/MondrianCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/MondrianEntitlements.cpp                           optional iokitcpp
