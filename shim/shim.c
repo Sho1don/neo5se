@@ -471,15 +471,6 @@ static void __attribute__((unused)) dump_facts(uintptr_t dtb)
 		return;
 	}
 
-	if (fdt_find_name(dtb, "memory", path, sizeof(path))) {
-		int n = fdt_node_regs(dtb, path, regs, 16);
-		for (int i = 0; i < n; i++) {
-			char key[8] = "reg0";
-			uint64_t v[2] = { regs[i * 2], regs[i * 2 + 1] };
-			key[3] = '0' + i;
-			fact("memory", key, v, 2);
-		}
-	}
 	/* The framebuffer the bootloader left for the panel: the reserved
 	 * memory region of the splash. */
 	static const char splash[][24] = {
@@ -495,23 +486,35 @@ static void __attribute__((unused)) dump_facts(uintptr_t dtb)
 	/* Every carve-out of /reserved-memory, by name: this is where the
 	 * framebuffer of the splash lives, and its node name changes between
 	 * vendors (the OPPO/Realme tree of this phone does not carry the
-	 * Xiaomi names above). */
+	 * Xiaomi names above). The console keeps the last page only, so the
+	 * lines that matter when the list is long (the memory banks) are
+	 * printed after it, at the bottom. */
 	{
-		static char rnames[16][28];
-		uint64_t rregs[32];
-		int n = fdt_reserved_regions_named(dtb, rregs, rnames, 16);
+		static char rnames[40][28];
+		uint64_t rregs[80];
+		int n = fdt_reserved_regions_named(dtb, rregs, rnames, 40);
+		fact("rmemcount", "n", (uint64_t[]){ (uint64_t)n }, 1);
 		for (int i = 0; i < n; i++) {
 			uint64_t v[2] = { rregs[i * 2], rregs[i * 2 + 1] };
 			fact("rmem", rnames[i], v, 2);
 		}
-	}
-	for (unsigned i = 0; compat[i][0]; i++) {
-		int n;
-		if (!fdt_find_compatible(dtb, compat[i], path, sizeof(path)))
-			continue;
-		n = fdt_node_regs(dtb, path, regs, 8);
-		if (n > 0)
-			fact("reg", path, regs, n * 2);
+		for (unsigned i = 0; compat[i][0]; i++) {
+			int n;
+			if (!fdt_find_compatible(dtb, compat[i], path, sizeof(path)))
+				continue;
+			n = fdt_node_regs(dtb, path, regs, 8);
+			if (n > 0)
+				fact("reg", path, regs, n * 2);
+		}
+		if (fdt_find_name(dtb, "memory", path, sizeof(path))) {
+			int n = fdt_node_regs(dtb, path, regs, 16);
+			for (int i = 0; i < n; i++) {
+				char key[8] = "reg0";
+				uint64_t v[2] = { regs[i * 2], regs[i * 2 + 1] };
+				key[3] = '0' + i;
+				fact("memory", key, v, 2);
+			}
+		}
 	}
 	con_skip();
 }
