@@ -76,7 +76,7 @@ batched into one packet. gpunostate=1 keeps the old behaviour for bisection.
  			}
  		}
  	}
-@@ -790,6 +808,155 @@
+@@ -790,6 +808,174 @@
  	}
  	return result;
  }
@@ -90,6 +90,25 @@ batched into one packet. gpunostate=1 keeps the old behaviour for bisection.
 + * and the CP does execute those when they arrive as type-4 register writes, so
 + * expand the groups and submit the expanded stream from a scratch buffer.
 + */
++#include <pexpert/pexpert.h>
++
++/*
++ * gpunostate=1 keeps the CP_SET_DRAW_STATE groups in the stream (the same
++ * boot-arg gate the bsd side parses as well). Read the arg here instead of
++ * calling the bsd api getter: the packed bsd component dead-strips the
++ * getter when no bsd-internal code calls it, and then the kernel-wide link
++ * reports an undefined symbol for exactly this one cross-module reference
++ * (seen for _mondrian_gpu_uc_nostate, Android CI never reached that stage).
++ */
++static int
++mondrian_gpu_uc_nostate_gate(void)
++{
++	int nostate = 0;
++
++	(void)PE_parse_boot_argn("gpunostate", &nostate, sizeof(nostate));
++	return nostate;
++}
++
 +IOReturn
 +MondrianGPUUserClient::expandDrawState(mondrian_buffer *src, uint32_t offset,
 +    uint32_t size, uint64_t *ib, uint32_t *dwords)
@@ -101,7 +120,7 @@ batched into one packet. gpunostate=1 keeps the old behaviour for bisection.
 +	bool changed = false;
 +	IOReturn result = kIOReturnUnsupported;
 +
-+	if (mondrian_gpu_uc_nostate() || size > kIn) {
++	if (mondrian_gpu_uc_nostate_gate() || size > kIn) {
 +		return kIOReturnUnsupported;
 +	}
 +	in = (uint8_t *)IOMalloc(size);
