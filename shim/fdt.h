@@ -33,6 +33,13 @@ int fdt_node_regs_cells(uintptr_t fdt, const char *path, uint64_t *out, int max,
 int fdt_reserved_regions(uintptr_t fdt, uint64_t *out, int max);
 
 /*
+ * The same walk, but it also collects the node name of each carve-out into
+ * names[i][28] (0 to skip them).
+ */
+int fdt_reserved_regions_named(uintptr_t fdt, uint64_t *out,
+	char (*names)[28], int max);
+
+/*
  * The biggest hole inside a memory region once the carve-outs of
  * /reserved-memory are taken out of it. Returns 1 and fills hole_base and
  * hole_size when there is one.

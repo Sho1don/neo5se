@@ -522,12 +522,30 @@ int fdt_find_compatible_part(uintptr_t fdt, const char *needle, char *out,
 	}
 }
 
-/*
- * The carve-outs of /reserved-memory. The nodes are children of
- * /reserved-memory, so their addresses use the cells of that node (2 and 2),
- * not the ones of the root.
- */
 int fdt_reserved_regions(uintptr_t fdt, uint64_t *out, int max)
+{
+	return fdt_reserved_regions_named(fdt, out, 0, max);
+}
+
+/* Copy a node name for the facts dump: at most 27 characters, always
+ * terminated (the buffer is a names[max][28] of the caller). */
+static void
+copy_name(char *dst, const char *src, int cap)
+{
+	int i = 0;
+
+	while (i + 1 < cap && src[i])
+		dst[i++] = *src++;
+	dst[i] = 0;
+}
+
+/*
+ * The same walk, but it also hands back the node name of each carve-out
+ * (names is names[max][28], or 0 to skip them). The names are what a dump
+ * needs to tell the splash apart from the rest.
+ */
+int fdt_reserved_regions_named(uintptr_t fdt, uint64_t *out,
+	char (*names)[28], int max)
 {
 	struct fdt_walk w = { .fdt = fdt, .strings = 0, .len = 0, .depth = 0 };
 	uintptr_t p, strings;
@@ -554,6 +572,16 @@ int fdt_reserved_regions(uintptr_t fdt, uint64_t *out, int max)
 				uint64_t v[2];
 				if (fdt_node_regs_cells(fdt, w.path, v, 1,
 				    2, 2) == 1 && v[1]) {
+					if (names) {
+						/* the leaf the walk is
+						 * standing at */
+						const char *leaf = w.path;
+						const char *s;
+						for (s = w.path; *s; s++)
+							if (*s == '/')
+								leaf = s + 1;
+						copy_name(names[n], leaf, 28);
+					}
 					out[n * 2] = v[0];
 					out[n * 2 + 1] = v[1];
 					n++;

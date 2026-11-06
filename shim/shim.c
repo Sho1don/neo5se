@@ -492,6 +492,19 @@ static void __attribute__((unused)) dump_facts(uintptr_t dtb)
 		if (n > 0)
 			fact("reg", path, regs, n * 2);
 	}
+	/* Every carve-out of /reserved-memory, by name: this is where the
+	 * framebuffer of the splash lives, and its node name changes between
+	 * vendors (the OPPO/Realme tree of this phone does not carry the
+	 * Xiaomi names above). */
+	{
+		static char rnames[16][28];
+		uint64_t rregs[32];
+		int n = fdt_reserved_regions_named(dtb, rregs, rnames, 16);
+		for (int i = 0; i < n; i++) {
+			uint64_t v[2] = { rregs[i * 2], rregs[i * 2 + 1] };
+			fact("rmem", rnames[i], v, 2);
+		}
+	}
 	for (unsigned i = 0; compat[i][0]; i++) {
 		int n;
 		if (!fdt_find_compatible(dtb, compat[i], path, sizeof(path)))
